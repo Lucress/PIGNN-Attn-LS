@@ -15,6 +15,20 @@ _VECTOR_FIELDS = [
     "U_newton",
     "S_start",
     "S_newton",
+    # AC-OPF decision space (per bus). Absent from the power-flow parquets;
+    # _concat_present skips any field a sample does not carry.
+    "S_load",
+    "S_gen_opf",
+    "Gen_p_min",
+    "Gen_p_max",
+    "Gen_q_min",
+    "Gen_q_max",
+    "Gen_p_avail",
+    "Gen_cost_c1",
+    "Gen_controllable",
+    "Gen_box_injection",
+    "Bus_vmin",
+    "Bus_vmax",
 ]
 
 _SCALAR_FIELDS = [
@@ -41,6 +55,7 @@ _BRANCH_FIELDS = [
     "Branch_n",
     "Y_Lines",
     "Y_C_Lines",
+    "Branch_rate_a",
 ]
 
 _BRANCH_INDEX_FIELDS = [
@@ -67,10 +82,71 @@ def _concat_present(samples, fields, dim=0):
 
 
 # --------------------------------------------------------------------------- #
+# Y-bus: sparse block diagonal
+# --------------------------------------------------------------------------- #
+
+# The block-diagonal Y-bus is the memory wall in this pipeline. Dense, it costs
+# (B*N)^2 * 16 bytes -- quadratic in batch*buses -- so case9241pegase at batch 8
+# asks for 81 GB and is OOM-killed, while the matrix is 99.98% zeros: a 9241-bus
+# grid has ~16k branches, i.e. ~41k nonzeros against 85M entries.
+#
+# Y is only ever used for the matvec Y @ V (opf_task.implied_injection and the
+# two physics-loss sites in train_valid_test_gridfm), so a sparse COO layout is
+# numerically identical and turns the cost into O(nnz * B).
+
+def block_diag_sparse(mats: List[torch.Tensor]) -> torch.Tensor:
+    """Sparse-COO block diagonal of dense or sparse square matrices."""
+    idx_chunks, val_chunks = [], []
+    off = 0
+    for m in mats:
+        n = m.shape[0]
+        sp = m if m.is_sparse else m.to_sparse_coo()
+        sp = sp.coalesce()
+        idx_chunks.append(sp.indices() + off)
+        val_chunks.append(sp.values())
+        off += n
+    if not idx_chunks:
+        return torch.zeros((0, 0), dtype=torch.complex128).to_sparse_coo()
+    indices = torch.cat(idx_chunks, dim=1)
+    values = torch.cat(val_chunks, dim=0)
+    return torch.sparse_coo_tensor(indices, values, (off, off),
+                                   dtype=values.dtype).coalesce()
+
+
+def ybus_matvec(Y: torch.Tensor, Vc: torch.Tensor) -> torch.Tensor:
+    """Y @ Vc for dense or sparse Y, accepting Vc as [N] or [1, N].
+
+    Returns the same leading shape it was given, so call sites do not have to
+    know which layout the collate produced.
+    """
+    squeeze_batch = False
+    if Vc.dim() == 2 and Vc.shape[0] == 1:
+        Vc = Vc.squeeze(0)
+        squeeze_batch = True
+    Ym = Y
+    if Ym.is_sparse:
+        if Ym.dim() > 2:
+            # Rebuild rather than squeeze: as_strided is unimplemented for the
+            # sparse CUDA backend, so squeeze() raises there.
+            if Ym.shape[0] != 1:
+                raise ValueError(f"sparse Y-bus with leading dim {Ym.shape[0]} != 1")
+            c = Ym.coalesce()
+            Ym = torch.sparse_coo_tensor(c.indices()[1:], c.values(),
+                                         tuple(Ym.shape[1:])).coalesce()
+        out = torch.sparse.mm(Ym, Vc.unsqueeze(-1)).squeeze(-1)
+    else:
+        if Ym.dim() > 2:                  # dense collate adds a batch axis
+            Ym = Ym.squeeze(0)
+        out = torch.matmul(Ym, Vc.unsqueeze(-1)).squeeze(-1)
+    return out.unsqueeze(0) if squeeze_batch else out
+
+
+# --------------------------------------------------------------------------- #
 # main API
 # --------------------------------------------------------------------------- #
 
-def collate_blockdiag(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, Union[torch.Tensor, None]]:
+def collate_blockdiag(samples: List[Dict[str, torch.Tensor]],
+                      sparse_ybus: bool = True) -> Dict[str, Union[torch.Tensor, None]]:
     """
     Collate per-sample graphs into one block-diagonal mega-graph.
 
@@ -113,12 +189,16 @@ def collate_blockdiag(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, Union
 
     have_all_y = all(isinstance(s.get("Ybus", None), torch.Tensor) for s in samples)
     if have_all_y and len(samples) > 0:
-        out["Ybus"] = torch.block_diag(*[s["Ybus"] for s in samples])
+        mats = [s["Ybus"] for s in samples]
+        out["Ybus"] = block_diag_sparse(mats) if sparse_ybus else torch.block_diag(*mats)
     else:
         out["Ybus"] = None
 
     for k, v in list(out.items()):
-        if isinstance(v, torch.Tensor) and k not in _SCALAR_FIELDS:
+        # A sparse Y-bus keeps its plain [N, N] shape: unsqueeze on sparse COO
+        # is awkward and every consumer goes through ybus_matvec, which accepts
+        # either layout.
+        if isinstance(v, torch.Tensor) and k not in _SCALAR_FIELDS and not v.is_sparse:
             out[k] = v.unsqueeze(0)
 
     out["sizes"] = sizes

@@ -195,6 +195,7 @@ class ChanghunDataset(Dataset):
         share_ybus: bool = False,
         share_grid: bool = False,
         complex_dtype: str = "complex64",
+        extra_binary_columns: Optional[List[str]] = None,
     ):
         self._per_unit = bool(per_unit)
         self._device = torch.device(device) if device is not None else None
@@ -298,6 +299,16 @@ class ChanghunDataset(Dataset):
         if not self._no_cache_dense_ybus:
             self._binary_cols_master.insert(self._binary_cols_master.index("u_start"), "Y_matrix")
 
+        # Opt-in passthrough for per-scenario columns that the power-flow
+        # datasets do not carry (the AC-OPF decision space: per-bus generation
+        # limits, available power, cost slope, voltage band, branch ratings).
+        # They are decoded and handed through untouched: no per-unit math and
+        # no share_grid caching, since they vary per scenario.
+        self._extra_binary_columns = [str(c) for c in (extra_binary_columns or [])]
+        self._binary_cols_master = self._binary_cols_master + [
+            c for c in self._extra_binary_columns if c not in self._binary_cols_master
+        ]
+
         self._read_columns = [
             "bus_number",
             "branch_number",
@@ -316,6 +327,29 @@ class ChanghunDataset(Dataset):
     def _present_columns(self, schema_names) -> List[str]:
         schema_names = set(schema_names)
         return [col for col in self._read_columns if col in schema_names]
+
+    def _attach_extra_columns(self, row: Dict[str, Any], r, available_columns) -> Dict[str, Any]:
+        """Decode opt-in extra columns as plain tensors, in stored units."""
+        if not self._extra_binary_columns:
+            return row
+        for col in self._extra_binary_columns:
+            if col not in available_columns:
+                continue
+            value = r[col] if not hasattr(r, "get") else r.get(col, None)
+            if value is None:
+                continue
+            arr = _as_np(value)
+            if np.iscomplexobj(arr):
+                tensor_dtype = self._complex_torch_dtype
+                arr = arr.astype(self._complex_np_dtype, copy=False)
+            elif np.issubdtype(arr.dtype, np.integer):
+                tensor_dtype = torch.int64
+                arr = arr.astype(np.int64, copy=False)
+            else:
+                tensor_dtype = self._real_torch_dtype
+                arr = arr.astype(self._real_np_dtype, copy=False)
+            row[col] = torch.as_tensor(arr, dtype=tensor_dtype, device=self._device)
+        return row
 
     def _build_row_dict(self, r: Union[pd.Series, Dict[str, Any]], available_columns) -> Dict[str, Any]:
         to_t = lambda x, dtype=None: torch.as_tensor(x, dtype=dtype, device=self._device)
@@ -381,7 +415,7 @@ class ChanghunDataset(Dataset):
                 "S_newton": to_t(S_newton_p, dtype=self._complex_torch_dtype),
             }
             row.update(self._shared_grid_tensors)
-            return row
+            return self._attach_extra_columns(row, r, available_columns)
 
         bus_typ = _as_np(r["bus_typ"], np.int64).reshape(N)
         vn_kv = _as_np(r["vn_kv"], self._real_np_dtype).reshape(N)
@@ -577,7 +611,7 @@ class ChanghunDataset(Dataset):
                 f"these fields"
             )
 
-        return row
+        return self._attach_extra_columns(row, r, available_columns)
 
     def _print_sbase_diagnostic(self, path, S_base_raw: float) -> None:
         """One-shot diagnostic: warn if the parquet's S_base disagrees with the
