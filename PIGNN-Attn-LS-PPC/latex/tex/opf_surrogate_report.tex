@@ -1,0 +1,1029 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.7in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{pdflscape}
+\usepackage{float}
+
+\title{AC-OPF Surrogates: GridFM, GridSFM, and LUMINA\\
+\large Two data pipelines, two training objectives, six grids}
+\author{PIGNN-Attn-LS-PPC experimental summary}
+\date{8 August 2026}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+This report compares three power-system OPF surrogates across \textbf{two
+independently constructed data pipelines} and, on OPFData, \textbf{two training
+objectives}.
+
+\paragraph{What the three models are --- they are not alike.} LUMINA and GridSFM
+are \emph{released foundation models} with public checkpoints, evaluated here
+zero-shot, fine-tuned and from scratch. \textbf{GridFM is not.} The ``GridFM'' in
+this study is a local re-implementation in GridFM's architectural style
+(the class \texttt{GridFMHeteroSurrogate}); nothing imports the released
+\texttt{gridfm\_graphkit} model and no GridFM checkpoint is loaded,
+which is why it appears only as ``scratch'' and has no zero-shot row. Comparisons
+involving GridFM in Sections~5--8 are therefore against a from-scratch model of
+our own. Section~\ref{sec:graphkit} repeats the OPFData experiments with the
+released \texttt{gridfm\_graphkit} model to close that gap; the conclusions do
+not change, but the reason to prefer one model over another does.
+
+The pipelines:
+
+\begin{itemize}\itemsep2pt
+\item the \textbf{pandapower pipeline}, which generates scenarios locally with
+\texttt{pandapower.runopp} and serves them through the branch-row direct-SI
+parquet used for the earlier power-flow study (four grids: case14, case118,
+case300, SimBench);
+\item the \textbf{OPFData pipeline}, which consumes DeepMind's published
+OPFData release (\texttt{arXiv:2406.07234}) natively through PyTorch
+Geometric's \texttt{OPFDataset} (two grids: case14, case118).
+\end{itemize}
+
+The two pipelines share nothing but the task definition, the loss, and the
+metric code. They differ in solver, perturbation design, per-unit convention and
+file format (Section~\ref{sec:pipelines}). Running the same three models through
+both is therefore a test of whether the model ranking is a property of the
+models or of the dataset --- which turns out to be the most informative result
+here (Section~\ref{sec:cross}).
+
+Hyperparameters are matched across pipelines and objectives: 40 epochs, LR
+$5\times10^{-4}$ and batch 8 for GridFM, LR $10^{-4}$ and batch 4 for LUMINA and
+GridSFM. Training-set sizes are comparable (11{,}998--12{,}053 for pandapower,
+13{,}500 for OPFData), so neither pipeline enjoys a data-volume advantage.
+
+\paragraph{The two objectives.} \textbf{Shared} is a single voltage-only loss
+applied to all three models ($w_{\rm mse}=1.0$, $w_{\rm phys}=10^{-2}$, limit
+weight 1.0, band weight 0). \textbf{Native} trains each model with the loss from
+its own repository (\texttt{native\_loss.py}). Evaluation is identical under
+both --- the same \texttt{opf\_task.opf\_metrics} scores every run --- so results
+are comparable across objectives even though the loss values are not.
+The native objectives are:
+
+\begin{itemize}\itemsep2pt
+\item \textbf{GridSFM}: \texttt{gridsfm.loss.compute\_loss}, ten weighted terms
+--- tanh-capped $\theta$/V/$P_g$/$Q_g$, BCE on feasibility, log-MSE on cost,
+log1p KCL $P$/$Q$, branch flow $P$/$Q$, thermal loading and a thermal-limit
+barrier. OPFData supplies \texttt{edge\_label} $(P_{ij},Q_{ij},P_{ji},Q_{ji})$
+and \texttt{rate\_a}, so every term is live except the two feasibility terms,
+which have no signal because OPFData ships solved instances only.
+\item \textbf{LUMINA}: \texttt{lumina.model.opf.losses.ACOPFLossFunction},
+weighting bus \emph{and} generator regression equally.
+\item \textbf{GridFM}: \texttt{gridfm\_graphkit}'s
+\texttt{MaskedReconstructionMSE} over $[V_M, V_A, P_G, Q_G, P_D, Q_D]$. Their
+\texttt{PBELoss} is not usable here (it needs a six-column YFF/YFT edge
+attribute that the OPFData adapter does not carry), so our physics term stands
+in for it; this substitution is printed in every run log.
+\end{itemize}
+
+\paragraph{Task.} The model receives the loads and the decision space
+(per-bus generation limits, cost slope, voltage band) and must produce the OPF
+operating point. A voltage-only head is \emph{sufficient in principle}: given
+the predicted profile the dispatch follows from \(S = V \odot \overline{YV}\),
+so all three surrogates keep their existing per-bus heads.
+
+\paragraph{Supervision, and why it is not neutral.}
+\label{par:supervision}
+The loss used throughout is
+\[
+\mathcal{L} = w_{\rm mse}\,\mathrm{MSE}(V_{\rm pred}, V_{\rm target})
+ + w_{\rm phys}\,[\text{balance at free buses} + \text{limit violation at controllable buses}],
+\]
+so \textbf{bus voltages are the only supervised quantity}. Both pipelines also
+carry the optimal dispatch, the objective value, and (pandapower only) the LMP
+duals; none of these entered the loss. Dispatch and cost appear only in the
+metrics, and the duals not at all.
+
+This choice keeps the three models comparable, but it is \emph{not} architecture
+neutral, and the results below must be read with that in mind:
+
+\begin{itemize}\itemsep2pt
+\item \textbf{GridFM} predicts voltages directly. The objective matches its
+architecture exactly, and it is unaffected.
+\item \textbf{LUMINA} also emits a generator head (\texttt{out\_dict.generator},
+258 parameters, trained on ACOPF dispatch in the released weights) which this
+setup never reads. Its bus head does not depend on it, so its voltage accuracy
+is unaffected; only its dispatch capability goes unmeasured.
+\item \textbf{GridSFM} is the one whose architecture this objective clearly does
+not fit. Its angle prediction is built on a DC prior computed \emph{from its own
+predicted} \(P_g\) (\texttt{model.py:234,243}) through a doubly detached path
+(\texttt{dc\_prior.py:102,243}), so \texttt{head\_Pg} receives no gradient ---
+confirmed by a single-batch probe. It also consumes the generation box
+structurally, building its angle prior from the box midpoint --- which is what
+made it uniquely sensitive to the conversion bug described in
+Section~\ref{sec:gridsfm}. This supervision mismatch is a real limitation of the
+comparison, but it was never the explanation of the observed failure.
+\end{itemize}
+
+The shared comparison is therefore a fair test of \emph{these models under
+voltage-only supervision}, which flatters GridFM and penalises GridSFM. That was
+stated as a caveat in earlier revisions; it is now measured
+(Section~\ref{sec:native}), and the effect is large enough to reverse the
+ranking on case118.
+
+\section{The two pipelines}
+\label{sec:pipelines}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{0.20\textwidth}p{0.36\textwidth}p{0.36\textwidth}}
+\toprule
+ & \textbf{pandapower pipeline} & \textbf{OPFData pipeline} \\
+\midrule
+Source & generated locally, \texttt{pp.runopp} & DeepMind OPFData release 1 \\
+Solver & pandapower interior point (PIPS) & PowerModels.jl + IPOPT \\
+Perturbation & voltage setpoints 0.90--1.10, load scaling 0.60--1.40 (case300: 0.90--1.10) & per-load scaling with independent noise, as published \\
+Topology & fixed per grid & fixed (perturbations \emph{not} enabled) \\
+Format & branch-row direct-SI parquet, 20 rows/group & PyG \texttt{OPFDataset}, \texttt{HeteroData} \\
+Per unit & rebased to 100~MVA, complex128 & already pu, \(S_{\rm base}=1\) \\
+Grids used & case14, case118, case300, SimBench & case14, case118 \\
+Train / val / test & \(\approx\)12k / 12k / 12k & 13{,}500 / 750 / 750 \\
+Loader & \texttt{Dataset\_optimized\_}\-\texttt{complex\_columns}, lazy row groups & \texttt{opfdata\_pipeline.py}, PyG \texttt{Batch} \\
+\bottomrule
+\end{tabular}
+\caption{The pipelines are independent implementations end to end. Both feed
+the same three models through the same loss and the same metric code
+(\texttt{opf\_task.py}).}
+\end{table}
+
+\paragraph{The decision spaces agree.} A useful consistency check fell out of
+the metric masks. For a given grid the two pipelines independently identify the
+same number of free and controllable buses per graph: case14 gives 9 free and 5
+controllable in both, case118 gives 64 free and 54 controllable in both. The
+two pipelines therefore agree on what the OPF problem \emph{is}, which is what
+makes the cross-pipeline comparison in Section~\ref{sec:cross} meaningful.
+
+\paragraph{OPFData cost-model validation.} The cost model was checked against
+the dataset's own stored objective: recomputing the IPOPT objective from the
+stored dispatch reproduces the published value to a ratio of 1.000000, and
+recovering the dispatch from the stored voltages matches
+\texttt{generator.y} to \(5.5\times10^{-7}\). The OPFData cost gaps below are
+therefore measured against a verified reference.
+
+\section{Datasets}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrrl}
+\toprule
+Pipeline & Dataset & Buses & Scenarios & Dispatch buses & Target residual \\
+\midrule
+pandapower & case14   &  14 & 36{,}000 &  5 & \(6.8\times10^{-8}\) \\
+           & case118  & 118 & 36{,}000 & 54 & \(1.6\times10^{-7}\) \\
+           & case300  & 300 & 36{,}163 & 69 & \(3.2\times10^{-6}\) \\
+           & SimBench &  94 & 36{,}000 & 70 & \(7.1\times10^{-7}\) (median) \\
+\midrule
+OPFData    & case14   &  14 & 15{,}000 &  5 & --- (verified vs.\ stored objective) \\
+           & case118  & 118 & 15{,}000 & 54 & --- (verified vs.\ stored objective) \\
+\bottomrule
+\end{tabular}
+\caption{The target residual is \(\max|\Delta P|\) in pu when the stored solution
+is substituted into the dataset's own \(Y_{\rm bus}\); it is the noise floor
+below which a model cannot be credited.}
+\end{table}
+
+Four preparation issues were found and corrected in the pandapower pipeline;
+each would have silently produced wrong results. The OPFData pipeline, being
+consumed as published, needed none of them --- which is part of its value as an
+independent check.
+
+\begin{itemize}\itemsep2pt
+\item \textbf{Sign convention.} In the backbone files \texttt{S\_demand} is
+already a signed injection, not positive demand. Reading it as demand put the
+balance residual at \(1.07\) pu on the \emph{ground truth}; corrected it is
+\(\sim\!10^{-7}\).
+\item \textbf{Parquet row groups.} The sources use 1900--2000 rows per group.
+Training shuffles, so each batch of 4 decoded a whole group: 3191~ms/batch
+against 176~ms/batch at 20 rows per group, an 18\(\times\) penalty. All files
+were re-laid-out.
+\item \textbf{Angle datum.} pandapower's case118 places its slack at
+\(+30^\circ\), so no bus sits near zero, while the other three grids use
+\(0^\circ\). The datum is a gauge choice --- \(S = V\odot\overline{YV}\) is
+invariant under a global phase rotation --- but it penalises any model that
+cannot observe the bus angle state. LUMINA's bus schema has no such input, so it
+paid \(\sim\!30^\circ\) before solving anything. Normalising the slack to
+\(0^\circ\) left \(|V|\), \(S_{\rm start}\), \(S_{\rm newton}\) and the balance
+residual bit-identical and moved only the angle metric
+(LUMINA \(52.2^\circ \rightarrow 34.4^\circ\); GridSFM \(22.7^\circ \rightarrow
+38.7^\circ\), i.e.\ the artifact had been flattering GridSFM).
+\item \textbf{Generation limits.} The stock pandapower limits are violated by the
+stored solutions, so the generating OPF used different ones. Limits are instead
+the observed per-bus dispatch envelope widened by 10\%, which makes the
+reference feasible by construction; the box is therefore the observed range, not
+the true one. Balance and voltage columns do not depend on this choice.
+\end{itemize}
+
+\section{Metrics, and one that does not survive scrutiny}
+\label{sec:metrics}
+
+What a metric can mean differs per bus. Where no controllable generation sits,
+the injection is known and the power-balance residual is a genuine error; where
+the dispatch is free, the meaningful quantity is how far the implied generation
+leaves its box. A plain residual over all buses would charge \emph{correct
+redispatch} as error, so everything is masked by the controllable set
+(\texttt{opf\_task.py}). Reported columns: voltage RMSE, angle RMSE, balance
+\(\Delta P_\infty\) at free buses, generation-limit violation at controllable
+buses, and the dispatch cost gap against the reference optimum.
+
+\paragraph{The pandapower cost gaps are computed against a malformed generation
+box.} The original conversion built the generation envelope on a redispatch
+delta rather than on generation, producing a box centred at \(-28\)~pu on
+case118. The full diagnosis is in Section~\ref{sec:gridsfm}; what matters here is
+that the cost gap is evaluated against that box, so the original cost column is
+not measuring what it claims to. Re-running on the corrected files
+(\texttt{-{}-gen\_box injection}) leaves voltage accuracy essentially unchanged
+but moves the cost gap by hundreds of points:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrr}
+\toprule
+Grid & Run & \(|V|\) RMSE (orig.) & \(|V|\) RMSE (rev.) & cost gap (orig.) & cost gap (rev.) \\
+\midrule
+case14  & GridFM scratch  & 8.94e-4 & 9.90e-4 & --- & 0.89\% \\
+case118 & GridFM scratch  & 1.32e-3 & 1.11e-3 & \(+3.20\%\) & \(-277.36\%\) \\
+        & LUMINA scratch  & 8.81e-3 & 9.15e-3 & \(+8.14\%\) & \(+3391.19\%\) \\
+        & LUMINA pre-FT   & 1.26e-2 & 1.32e-2 & \(+11.65\%\) & \(+149.78\%\) \\
+case300 & GridFM scratch  & 6.57e-3 & 7.07e-3 & \(+156.44\%\) & \(-0.71\%\) \\
+        & LUMINA scratch  & 2.02e-2 & 1.98e-2 & \(+749.21\%\) & \(+10.20\%\) \\
+\bottomrule
+\end{tabular}
+\caption{Same models, same scenarios, near-identical voltage predictions --- and
+cost gaps that move by hundreds of percentage points and change sign once the
+generation box is built correctly. The voltage columns move by at most 13\%,
+which is why the model ranking is unaffected by the correction.}
+\end{table}
+
+The voltage and balance metrics are stable across the correction; the cost gap is
+not. \textbf{All model rankings in this report are therefore made on voltage and
+balance metrics}, and the pandapower cost column should be disregarded entirely.
+Even after correction the case118 cost gaps remain implausible
+(\(-277\%\), \(+3391\%\)), which is consistent with the further finding that
+case118's load cannot be recovered from its stored base generation --- so no
+absolute cost reference exists for that grid. The OPFData cost gaps are the only
+ones in this report measured against a verified reference
+(Section~\ref{sec:pipelines}). A negative gap means the dispatch is cheaper than
+optimal, i.e.\ infeasible.
+
+\section{Results: pandapower pipeline}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrr}
+\toprule
+Grid & Run & RMSE & \(|V|\) RMSE & \(\theta\) [deg] & \(\Delta P_\infty\) (unmasked) \\
+\midrule
+case14 & \textbf{GridFM scratch} & \textbf{1.007e-3} & \textbf{8.94e-4} & \textbf{0.027} & 3.09e-1 \\
+       & LUMINA pre-FT          & 8.225e-3 & 3.47e-3 & 0.427 & 4.05e-1 \\
+       & LUMINA scratch         & 1.074e-2 & 3.61e-3 & 0.579 & 4.20e-1 \\
+       & GridSFM scratch$^{\dagger}$ & 3.795e-2 & 2.29e-3 & 2.171 & 4.44e-1 \\
+       & GridSFM pre-FT$^{\dagger}$  & 5.263e-2 & 3.38e-3 & 3.009 & 8.87e-1 \\
+\midrule
+SimBench & \textbf{GridFM scratch} & \textbf{7.594e-3} & \textbf{4.74e-3} & \textbf{0.340} & 1.87 \\
+         & LUMINA scratch         & 1.216e-1 & 4.62e-2 & 6.445 & 3.38 \\
+         & LUMINA pre-FT          & 1.217e-1 & 4.75e-2 & 6.422 & 2.93 \\
+         & GridSFM scratch$^{\dagger}$ & 2.489e-1 & 5.57e-2 & 13.900 & 1.05 \\
+         & GridSFM pre-FT$^{\dagger}$  & 4.582e-1 & 5.57e-2 & 26.061 & 2.27 \\
+\midrule
+case118 & \textbf{GridFM scratch} & \textbf{6.459e-3} & \textbf{1.32e-3} & \textbf{0.362} & 1.53e-1$^{\ast}$ \\
+        & LUMINA scratch         & 2.445e-2 & 8.81e-3 & 1.307 & 1.00$^{\ast}$ \\
+        & LUMINA pre-FT          & 3.023e-2 & 1.26e-2 & 1.574 & 9.37e-1$^{\ast}$ \\
+        & GridSFM$^{\dagger\ddagger}$ & \multicolumn{4}{l}{frozen; did not complete (epochs 25 / 28 of 40)} \\
+\midrule
+case300 & \textbf{GridFM scratch} & \textbf{2.847e-2} & \textbf{6.57e-3} & \textbf{1.587} & 1.65$^{\ast}$ \\
+        & LUMINA pre-FT          & 7.144e-2 & 1.99e-2 & 3.931 & 6.49$^{\ast}$ \\
+        & LUMINA scratch         & 7.132e-2 & 2.02e-2 & 3.919 & 1.15e1$^{\ast}$ \\
+        & GridSFM$^{\dagger\ddagger}$ & \multicolumn{4}{l}{frozen; did not complete (epochs 38 / 39 of 40)} \\
+\bottomrule
+\end{tabular}
+\caption{Final test results.
+$^{\ast}$masked balance at free buses; elsewhere the logs record only the
+unmasked residual, so the columns are not comparable across grid blocks.
+$^{\dagger}$\textbf{every} GridSFM row here --- including the case14 rows, which
+did not freeze --- was produced on the defective conversion
+(Section~\ref{sec:gridsfm}) and measures the bug, not the model. Not freezing is
+not the same as being valid: case14 trained, but against a generation box still
+built on a redispatch delta, so its RMSE reflects a decision space that does not
+describe the OPF problem. No GridSFM number in this table should be quoted as a
+capability measurement, and the corrected case14 numbers are not yet available
+to replace them.
+$^{\ddagger}$still running at the time of writing, both in the frozen regime, so
+they cannot change any conclusion.}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrr}
+\toprule
+Grid & Run & RMSE & \(|V|\) RMSE & \(\theta\) [deg] \\
+\midrule
+case14  & GridFM scratch  & \textbf{1.156e-3} & \textbf{9.90e-4} & \textbf{0.034} \\
+        & LUMINA scratch  & 6.739e-3 & 2.81e-3 & 0.351 \\
+        & LUMINA pre-FT   & 1.205e-2 & 4.23e-3 & 0.646 \\
+        & GridSFM scratch & 4.599e-2 & 4.79e-3 & 2.621 \\
+        & GridSFM pre-FT  & 4.860e-2 & 2.15e-3 & 2.782 \\
+\midrule
+case118 & GridFM scratch  & \textbf{6.342e-3} & 1.11e-3 & \textbf{0.358} \\
+        & LUMINA pre-FT   & 3.059e-2 & 1.32e-2 & 1.581 \\
+        & LUMINA scratch  & 3.133e-2 & 9.15e-3 & 1.717 \\
+        & GridSFM pre-FT  & 5.065e-2 & \textbf{2.07e-3} & 2.900 \\
+        & GridSFM scratch$^{\S}$ & 3.546e-1 & 1.02e-2 & 20.306 \\
+\midrule
+case300 & GridFM scratch  & \textbf{2.973e-2} & \textbf{7.07e-3} & \textbf{1.655} \\
+        & LUMINA scratch  & 6.992e-2 & 1.98e-2 & 3.843 \\
+        & LUMINA pre-FT   & 7.276e-2 & 2.01e-2 & 4.006 \\
+        & GridSFM pre-FT$^{\S}$  & 1.649e-1 & 1.76e-2 & 9.396 \\
+        & GridSFM scratch$^{\S}$ & 3.166e-1 & 1.63e-2 & 18.118 \\
+\bottomrule
+\end{tabular}
+\caption{pandapower pipeline on the \emph{corrected} conversion
+(\texttt{-{}-gen\_box injection}), voltage-only objective. These supersede the
+GridSFM rows of Table~4. GridSFM no longer freezes but remains last on every
+grid: correcting the bug made the numbers valid, it did not change the ranking.
+Its \(|V|\) is a different story --- 2.07e-3 on case118, four times better than
+LUMINA and close to GridFM --- and only its angle is poor, the same
+magnitude-good/angle-bad signature that the native objective repairs
+(Section~\ref{sec:native}). $^{\S}$scored from the epoch-37/38 checkpoint after
+the run exceeded the 24\,h limit before its own test pass, so these three are
+marginally pessimistic relative to a full 40 epochs. They do not change the
+picture: on corrected data GridSFM's angle error is still 9--20\(^\circ\) on
+case118 scratch and case300, against \(0.36\)--\(1.66^\circ\) for GridFM.
+Correcting the conversion removed the freeze; it did not make GridSFM
+competitive under a voltage-only objective.}
+\end{table}
+
+\section{Results: OPFData pipeline, shared objective}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrrrr}
+\toprule
+Grid & Run & RMSE & \(|V|\) RMSE & \(\theta\) [deg] & \(\Delta P_\infty\) & limit \(P\) & cost gap \\
+\midrule
+case14 & \textbf{GridFM scratch} & \textbf{5.950e-4} & \textbf{4.52e-4} & \textbf{0.022} & \textbf{8.07e-3} & \textbf{4.47e-3} & \textbf{0.14\%} \\
+       & LUMINA pre-FT          & 7.683e-3 & 2.03e-3 & 0.425 & 7.70e-2 & 4.95e-2 & 13.55\% \\
+       & LUMINA scratch         & 7.771e-3 & 1.77e-3 & 0.434 & 7.10e-2 & 6.30e-2 & 12.69\% \\
+       & GridSFM pre-FT         & 7.919e-3 & 1.57e-3 & 0.445 & 3.97e-2 & 3.93e-2 & 7.24\% \\
+       & GridSFM scratch$^{\dagger}$ & 3.105e-2 & 3.03e-2 & 0.380 & 5.82e-2 & 1.20e-1 & 30.00\% \\
+\midrule
+case118 & \textbf{GridFM scratch} & \textbf{2.271e-2} & \textbf{3.32e-3} & \textbf{1.287} & \textbf{1.15e-1} & \textbf{1.47e-1} & 0.86\% \\
+        & LUMINA scratch         & 3.288e-2 & 1.19e-2 & 1.755 & 1.13 & 1.90 & \(-1.71\%\) \\
+        & LUMINA pre-FT          & 3.694e-2 & 1.46e-2 & 1.944 & 1.69 & 1.80 & 2.79\% \\
+        & GridSFM scratch$^{\dagger}$ & 1.196e-1 & 3.39e-2 & 6.571 & 3.93e-1 & 2.36e-1 & 21.21\% \\
+        & GridSFM pre-FT$^{\dagger}$  & 3.507e-1 & 3.39e-2 & 20.000 & 1.71 & 5.85 & 11.53\% \\
+\bottomrule
+\end{tabular}
+\caption{Voltage-only objective, all runs complete (40 epochs). The
+\(\Delta P_\infty\) and limit columns here are batch-averaged and therefore
+understate the true worst bus --- see Section~\ref{sec:resid}; pooled residuals
+are given there for the native runs only.
+$^{\dagger}$degenerate: three of these report a \(|V|\) RMSE of exactly
+3.3899e-02 or 3.03e-02 with a flat loss, the collapsed-magnitude signature of
+Section~\ref{sec:gridsfm}. Under GridSFM's own objective none of them collapses
+(Section~\ref{sec:native}).}
+\end{table}
+
+\section{Results: OPFData pipeline, native objectives}
+\label{sec:native}
+
+Each model trained with the loss from its own repository, scored with the same
+metrics. Every configuration was run independently on two clusters (alex A40,
+helma H100) as a reproducibility check.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrrr}
+\toprule
+Grid & Run & RMSE (helma) & RMSE (alex) & \(|V|\) RMSE & \(\theta\) [deg] & cost gap \\
+\midrule
+case14 & GridFM scratch  & 1.040e-3 & 4.300e-3 & 4.97e-4 & 0.052 & 1.48\% \\
+       & GridSFM scratch & 4.710e-3 & 1.918e-3 & 1.18e-3 & 0.261 & 3.08\% \\
+       & GridSFM pre-FT  & 5.327e-3 & 5.016e-3 & 1.32e-3 & 0.296 & 3.40\% \\
+       & LUMINA pre-FT   & 7.247e-3 & 7.468e-3 & 1.80e-3 & 0.402 & \(-6.28\%\) \\
+       & LUMINA scratch  & 7.523e-3 & 7.189e-3 & 1.71e-3 & 0.420 & \(-12.24\%\) \\
+\midrule
+case118 & \textbf{GridSFM pre-FT} & \textbf{2.080e-3} & \textbf{2.092e-3} & \textbf{7.53e-4} & \textbf{0.111} & 2.69\% \\
+        & GridFM scratch  & 2.321e-2 & 2.311e-2 & 4.15e-3 & 1.308 & 4.48\% \\
+        & LUMINA scratch  & 2.637e-2 & 2.693e-2 & 5.04e-3 & 1.483 & 19.62\% \\
+        & LUMINA pre-FT   & 3.143e-2 & 3.134e-2 & 5.64e-3 & 1.772 & \(-2.94\%\) \\
+        & GridSFM scratch$^{\ast}$ & 3.657e-2 & \textbf{1.809e-3} & 3.39e-2 & 0.786 & \(-3.60\%\) \\
+\bottomrule
+\end{tabular}
+\caption{Native objectives. \(|V|\), \(\theta\) and cost columns are the helma
+run. $^{\ast}$the two clusters disagree by \(20\times\) on this row: the helma
+run collapsed (\(|V|\) pinned at 3.39e-2) while the alex run reached 1.809e-3
+(\(|V|\) 5.33e-4, \(\theta\) 0.099\(^\circ\)) --- the best result anywhere in
+this study. GridSFM-from-scratch therefore collapses \emph{stochastically}; its
+pretrained runs did not collapse on either cluster.}
+\end{table}
+
+\paragraph{The objective, not the architecture, decided the earlier ranking.}
+On case118 GridSFM goes from last under the shared objective to first under its
+own, and the margin is not marginal:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrr}
+\toprule
+Grid & Run & shared & native & factor \\
+\midrule
+case118 & GridSFM pre-FT  & 3.507e-1 & 2.080e-3 & \textbf{169\(\times\)} \\
+        & GridSFM scratch & 1.196e-1 & 3.657e-2 / 1.809e-3 & 3.3--66\(\times\) \\
+        & LUMINA scratch  & 3.288e-2 & 2.637e-2 & 1.25\(\times\) \\
+        & LUMINA pre-FT   & 3.694e-2 & 3.143e-2 & 1.18\(\times\) \\
+        & GridFM scratch  & 2.271e-2 & 2.321e-2 & 0.98\(\times\) (worse) \\
+\midrule
+case14  & GridSFM scratch & 3.105e-2 & 4.710e-3 & 6.6\(\times\) \\
+        & GridSFM pre-FT  & 7.919e-3 & 5.327e-3 & 1.5\(\times\) \\
+        & LUMINA pre-FT   & 7.683e-3 & 7.247e-3 & 1.06\(\times\) \\
+        & GridFM scratch  & 5.950e-4 & 1.040e-3 & 0.57\(\times\) (worse) \\
+\bottomrule
+\end{tabular}
+\caption{Test RMSE under each objective. The ordering of the \emph{gains} is the
+result: GridSFM \(\gg\) LUMINA \(>\) GridFM, which is exactly the order in which
+the shared voltage-only objective departs from what each architecture expects.}
+\end{table}
+
+\subsection*{Power-balance residuals}
+\label{sec:resid}
+
+Voltage RMSE says how close the predicted operating point is to the reference
+one; it does not say whether that point satisfies the network equations. The
+residual \(\Delta S = S_{\rm implied} - S_{\rm load}\) at buses with no
+controllable generation does, and it is the quantity an operator would actually
+care about. All statistics below are pooled over every free bus in the test set
+and are for the native-objective runs.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrrrr}
+\toprule
+Grid & Run & \(\Delta P^{\infty}\) & \(\Delta Q^{\infty}\) & \(\overline{|\Delta P|}\) & \(\overline{|\Delta Q|}\) & p95\(|\Delta P|\) & p95\(|\Delta Q|\) \\
+\midrule
+case14 & GridFM scratch  & \textbf{2.450e-2} & \textbf{2.166e-2} & 3.963e-3 & \textbf{1.854e-3} & \textbf{1.023e-2} & \textbf{5.053e-3} \\
+       & GridSFM pre-FT  & 3.143e-2 & 3.888e-2 & \textbf{3.470e-3} & 3.934e-3 & 1.186e-2 & 1.134e-2 \\
+       & GridSFM scratch & 4.110e-2 & 3.551e-2 & 3.462e-3 & 4.365e-3 & 1.200e-2 & 1.439e-2 \\
+       & LUMINA pre-FT   & 1.484e-1 & 6.460e-2 & 2.998e-2 & 1.274e-2 & 8.574e-2 & 3.358e-2 \\
+       & LUMINA scratch  & 1.739e-1 & 7.542e-2 & 3.957e-2 & 1.261e-2 & 1.140e-1 & 3.180e-2 \\
+\midrule
+case118 & \textbf{GridSFM pre-FT} & \textbf{2.646e-1} & 3.125e-1 & \textbf{9.011e-3} & \textbf{1.101e-2} & \textbf{3.566e-2} & \textbf{3.712e-2} \\
+        & GridFM scratch  & 3.975e-1 & \textbf{2.376e-1} & 3.045e-2 & 1.830e-2 & 9.613e-2 & 5.603e-2 \\
+        & GridSFM scratch & 6.411e-1 & 2.436e+0 & 4.519e-2 & 3.129e-1 & 1.209e-1 & 1.717e+0 \\
+        & LUMINA pre-FT   & 5.297e+0 & 1.331e+0 & 1.862e-1 & 8.455e-2 & 5.989e-1 & 2.878e-1 \\
+        & LUMINA scratch  & 6.477e+0 & 3.692e+0 & 1.569e-1 & 1.000e-1 & 6.653e-1 & 2.517e-1 \\
+\bottomrule
+\end{tabular}
+\caption{Power-balance residuals in pu on a 100~MVA base (so 1e-2~pu \(=\)
+1~MW/MVAr), pooled over all free buses of the test set. Rows are ordered by
+\(\overline{|\Delta P|}\) within each grid.}
+\end{table}
+
+\paragraph{The residual view mostly agrees with RMSE, and where it does not it
+is more informative.} On case118 GridSFM pre-FT leads on every column except
+\(\Delta Q^{\infty}\), where GridFM is better (2.376e-1 vs 3.125e-1). So GridSFM
+is the better surrogate on average --- \(3.4\times\) lower
+\(\overline{|\Delta P|}\) --- while GridFM has the better \emph{worst-case}
+reactive behaviour. An RMSE-only table cannot show that trade-off.
+
+On case14 the picture is mixed rather than a GridFM sweep: GridSFM's
+\(\overline{|\Delta P|}\) is marginally lower (3.46--3.47e-3 vs 3.96e-3) while
+GridFM wins the other five columns. Given the scratch-run variance of
+Section~\ref{sec:native}, case14 should be read as a tie between the two.
+
+LUMINA is decisively last on both grids by every residual measure, and by a
+wider margin than its voltage RMSE suggests: on case118 its worst-bus \(\Delta
+P\) is 5.3--6.5~pu, i.e.\ 530--650~MW unbalanced at a single bus, against
+0.26--0.40~pu for the other two. Its bus voltages are only \(1.4\times\) worse
+than GridFM's in RMSE but its residuals are \(6\)--\(16\times\) worse. Accurate
+voltages do not imply a physically consistent operating point, which is the main
+argument for reporting residuals alongside RMSE.
+
+\paragraph{A correction to how \(\Delta P^{\infty}\) was computed.} The
+per-epoch metric block accumulates every quantity as a batch-size-weighted mean
+across batches. That is correct for means but not for a maximum: the
+\(\Delta P^{\infty}\) reported in earlier revisions (and in Table~6) is the
+\emph{average of per-batch maxima}, which understates the true worst bus, and a
+percentile cannot be recovered from per-batch summaries at all. The table above
+pools the per-bus residuals and summarises once. The difference is not cosmetic
+--- \(3\)--\(6\times\) on the runs where both are available:
+
+\begin{center}
+\small
+\begin{tabular}{lrr}
+\toprule
+Run & \(\Delta P^{\infty}\) as reported & \(\Delta P^{\infty}\) pooled \\
+\midrule
+case118 GridFM scratch  & 1.15e-1 & 3.975e-1 \\
+case118 GridSFM pre-FT  & 6.72e-2 & 2.646e-1 \\
+case118 LUMINA scratch  & 1.13    & 6.477e+0 \\
+case14  GridFM scratch  & 8.07e-3 & 2.450e-2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The pandapower driver already pooled correctly, so its \(\Delta P^{\infty}\)
+column was never affected --- but that also means the two pipelines were
+reporting the same symbol under two different definitions, and cross-pipeline
+\(\Delta P^{\infty}\) comparisons in earlier revisions should be discarded.
+
+The mechanism is visible in the angle column. Under the shared objective
+GridSFM's case118 angle error is \(20.000^\circ\) (a clip bound); under its own
+objective it is \(0.111^\circ\), twelve times better than GridFM's
+\(1.308^\circ\). GridSFM builds its angle prior from its own predicted \(P_g\)
+through a doubly detached path, so a voltage-only loss leaves \texttt{head\_Pg}
+untrained and the angle unanchored. Supervising \(P_g\) --- which its native
+loss does --- repairs it. This was stated as a hypothesis in earlier revisions
+and is now confirmed.
+
+GridFM is the mirror image: it gets \emph{worse} under the native objective on
+both grids, because the shared voltage-only loss was already exactly what its
+architecture emits, and adding \(P_G\)/\(Q_G\)/\(P_D\)/\(Q_D\) reconstruction
+targets dilutes it. LUMINA sits between the two, gaining 6--25\%, consistent
+with its generator head being trained rather than ignored.
+
+\paragraph{Pretrained runs replicate; scratch runs do not.} The two clusters
+agree to 0.3--2\% on every \emph{pretrained} case118 row --- GridSFM pre-FT
+2.080e-3 vs 2.092e-3, GridFM 2.321e-2 vs 2.311e-2, LUMINA pre-FT 3.143e-2 vs
+3.134e-2 --- so the \(11\times\) case118 result is solid.
+
+Scratch runs are a different matter and the variance is not small:
+
+\begin{itemize}\itemsep2pt
+\item GridFM case14: 1.040e-3 (helma) vs 4.300e-3 (alex), \(4.1\times\).
+\item GridSFM case14: 4.710e-3 vs 1.918e-3, \(2.5\times\) --- which swaps its
+rank against GridFM.
+\item GridSFM case118: 3.657e-2 vs 1.809e-3, \(20\times\). The helma run
+collapsed its magnitude head; the alex run did not, and produced the best number
+in this study.
+\end{itemize}
+
+The last is the important one: \textbf{the magnitude collapse is stochastic in
+scratch runs.} It is not a property of the model, the objective or the pipeline
+--- the same configuration collapsed on one cluster and reached 1.809e-3 on the
+other. Every collapsed run in this document is a scratch run; no pretrained run
+collapsed anywhere. Pretraining appears to place GridSFM outside the basin that
+leads to collapse, which is a concrete reason to prefer its released checkpoint
+that has nothing to do with transfer of grid knowledge.
+
+Consequently \textbf{no ordering should be quoted from a single scratch run},
+on either grid. Seed repeats are required before any scratch row is used to rank
+models. Pretrained rows and case118 margins are safe.
+
+\subsection*{The released GridFM model versus our re-implementation}
+\label{sec:graphkit}
+
+Every GridFM number above comes from a local model written in GridFM's style
+(Section~1). LUMINA and GridSFM are run from their own repositories, so this was
+the one place where the comparison was not like-for-like. The released model,
+\texttt{gridfm\_graphkit.models.gnn\_heterogeneous\_gns.GNS\_heterogeneous}, was
+therefore run on the same two grids under both objectives, at the same capacity
+(hidden 48, 12 layers, 8 heads --- the released config, which the mirror already
+matched).
+
+The released model is not a renamed copy. It injects a physics correction at
+\emph{every} layer (branch flows \(\rightarrow\) node injections \(\rightarrow\)
+\texttt{physics\_mlp}), bounds \(|V|\) with a sigmoid against the per-bus band
+rather than a fixed clamp, carries a generator head, pins known quantities to
+their inputs through \texttt{mask\_dict}, and --- most relevant here --- ends in
+a task-specific physics decoder that recovers \(Q_g\) at PV and slack buses from
+the nodal reactive balance instead of learning it.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lllrrrrr}
+\toprule
+Grid & Obj. & Implementation & RMSE & \(|V|\) RMSE & \(\Delta P^{\infty}\) & \(\overline{|\Delta P|}\) & p95\(|\Delta P|\) \\
+\midrule
+case14 & shared & mirror   & \textbf{5.950e-4} & \textbf{4.52e-4} & 2.450e-2 & 3.963e-3 & 1.023e-2 \\
+       &        & released & 6.349e-4 & 5.00e-4 & \textbf{1.123e-2} & \textbf{1.245e-3} & \textbf{4.039e-3} \\
+       & native & mirror   & \textbf{1.040e-3} & \textbf{4.97e-4} & \textbf{2.450e-2}$^{\ast}$ & \textbf{3.963e-3}$^{\ast}$ & \textbf{1.023e-2}$^{\ast}$ \\
+       &        & released & 1.212e-3 & 7.46e-4 & 7.719e-2 & 8.608e-3 & 3.292e-2 \\
+\midrule
+case118 & shared & mirror   & \textbf{2.271e-2} & \textbf{3.32e-3} & 3.975e-1 & 3.045e-2 & 9.613e-2 \\
+        &        & released & 2.374e-2 & 4.74e-3 & \textbf{2.673e-1} & \textbf{1.640e-2} & \textbf{4.504e-2} \\
+        & native & mirror   & \textbf{2.321e-2} & \textbf{4.15e-3} & \textbf{3.975e-1} & \textbf{3.045e-2} & \textbf{9.613e-2} \\
+        &        & released & 2.904e-2 & 1.43e-2 & 4.969e+0 & 2.364e-1 & 7.219e-1 \\
+\bottomrule
+\end{tabular}
+\caption{Local re-implementation versus the released \texttt{gridfm\_graphkit}
+model, same capacity and same data. $^{\ast}$the mirror's residual columns were
+pooled from its native-objective checkpoint (Section~\ref{sec:resid}); its
+shared-objective residuals were not re-scored, so the two mirror rows repeat the
+same figures and only the RMSE columns differ between them.}
+\end{table}
+
+\paragraph{The released model trades a little voltage accuracy for a much more
+consistent operating point.} Under the shared objective its RMSE is
+\emph{worse} by 5--7\% on both grids, while its power-balance residuals are far
+better: \(\overline{|\Delta P|}\) improves \(3.2\times\) on case14 (1.245e-3 vs
+3.963e-3) and \(1.9\times\) on case118 (1.640e-2 vs 3.045e-2), with
+\(\Delta P^{\infty}\) improving \(2.2\times\) and \(1.5\times\). That is exactly
+the behaviour its architecture would predict: the per-layer physics feedback and
+the physics decoder push the prediction towards satisfying the network equations
+rather than towards matching the reference voltages.
+
+This is a concrete instance of the point made in Section~\ref{sec:resid}:
+ranked on RMSE the mirror wins, ranked on residuals the released model wins, and
+the two answers are both correct about different things. \textbf{Which model is
+``better'' here depends on whether the downstream use needs a voltage estimate
+or a feasible operating point.}
+
+\paragraph{GridFM's own loss hurts the released model too, and more.} Under the
+native objective the released model degrades sharply on case118 ---
+\(\overline{|\Delta P|}\) rises from 1.640e-2 to 2.364e-1, a factor of 14 --- and
+its \(|V|\) RMSE triples. The mirror showed the same direction
+(Section~\ref{sec:native}) but not the same magnitude. The likely reason is
+mechanical: with \texttt{MaskedReconstructionMSE} the supervised \(P_G\) and
+\(Q_G\) come out of the physics decoder, so an error signal on them now
+propagates back through the physics path that otherwise regularises the voltage
+prediction. This is a hypothesis; it has not been isolated.
+
+\paragraph{What this does and does not change.} The GridSFM result of
+Section~\ref{sec:native} survives: on case118 under native objectives GridSFM
+reaches 2.080e-3 RMSE and \(\overline{|\Delta P|}\) 9.011e-3, still ahead of the
+released GridFM's best case118 configuration (2.374e-2 and 1.640e-2) by
+\(11\times\) and \(1.8\times\) respectively. Swapping in the real GridFM does
+not overturn any ranking in this report; it does change the reason to prefer
+one model over another, and it removes the last respect in which GridFM was
+being evaluated differently from the other two.
+
+\paragraph{One asymmetry remains.} \texttt{gridfm\_graphkit} ships no weights
+--- no checkpoint file and no HuggingFace reference in the repository --- so
+GridFM is scratch-only under either implementation, while LUMINA and GridSFM
+have public checkpoints. No GridFM row in this report is, or can be, a
+pretrained one.
+
+\paragraph{Conversion correctness.} The released model computes branch flows
+itself and so needs the per-branch admittance split (\(Y_{ff}\), \(Y_{ft}\))
+across ten edge columns, where this project carries only the two-column Y-bus
+off-diagonal. The split was rebuilt from the branch model and checked by
+re-assembling a Y-bus from it and comparing against the dataset's own: relative
+error \(1.8\times10^{-16}\) (case14) and \(7.3\times10^{-17}\) (case118) on
+OPFData, and \(1.4\)--\(2.6\times10^{-16}\) across case118, case300, GBnetwork
+and SimBench on the parquet pipeline. The check is not ceremonial: a first
+version applied the per-unit bus bases a second time --- the parquet loader has
+already applied them --- and missed the Y-bus by a relative \(7.5\times10^{2}\)
+without raising anything.
+
+\section{Cross-pipeline comparison}
+\label{sec:cross}
+
+Both pipelines cover case14 and case118 with matched hyperparameters and
+comparable training-set sizes, so the same model can be compared head to head.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrr}
+\toprule
+Grid & Run & pandapower RMSE & OPFData RMSE & ratio \\
+\midrule
+case14 & GridFM scratch  & 1.007e-3 & 5.950e-4 & 0.59 \\
+       & LUMINA pre-FT   & 8.225e-3 & 7.683e-3 & 0.93 \\
+       & LUMINA scratch  & 1.074e-2 & 7.771e-3 & 0.72 \\
+       & GridSFM pre-FT  & 4.860e-2$^{c}$ & 7.919e-3 & 0.16 \\
+       & GridSFM scratch & 4.599e-2$^{c}$ & 3.105e-2 & 0.68 \\
+\midrule
+case118 & GridFM scratch & 6.459e-3 & 2.271e-2 & \textbf{3.52} \\
+        & LUMINA scratch & 2.445e-2 & 3.288e-2 & 1.34 \\
+        & LUMINA pre-FT  & 3.023e-2 & 3.694e-2 & 1.22 \\
+\bottomrule
+\end{tabular}
+\label{tab:cross}
+\caption{Ratio \(<1\) means the model does better on OPFData. For
+GridFM and LUMINA the \emph{ordering} is preserved on both grids in both
+pipelines, but the margins are not. $^{c}$GridSFM's pandapower entries are from
+the \emph{corrected} conversion (Table~5), so these two ratios are valid; both
+say GridSFM does markedly better on OPFData than on pandapower under the same
+objective. No case118 GridSFM ratio is given because both of its OPFData
+shared-objective runs are the collapsed ones.}
+\end{table}
+
+\paragraph{The GridFM--LUMINA ranking is a property of the models; the margin is
+not.} GridFM leads LUMINA on both grids in both pipelines. That this survives a
+complete change of solver, perturbation design, per-unit convention and file
+format --- and survives the conversion correction, which moves their voltage
+RMSE by at most 13\% --- is good evidence that this part of the ranking is real
+and not a dataset artifact.
+
+The \emph{size} of the lead is another matter. GridFM's margin over LUMINA is
+\(8\times\) on pandapower case14 and \(13\times\) on OPFData case14, but on
+case118 it is \(3.8\times\) on pandapower and only \(1.4\times\) on OPFData. Any
+claim of the form ``GridFM is an order of magnitude better'' is pipeline
+dependent and should not be made.
+
+\paragraph{OPFData case118 is harder for GridFM specifically.} GridFM is
+\(3.5\times\) worse on OPFData case118 than on pandapower case118, while LUMINA
+is only \(1.2\)--\(1.3\times\) worse. Since the decision spaces are identical
+(64 free / 54 controllable buses in both), the difference lies in the scenario
+distribution: OPFData perturbs every load independently, whereas the pandapower
+backbone applies a global load-scaling factor with voltage-setpoint variation.
+The independent-perturbation design plausibly produces a higher-dimensional
+target manifold that penalises the highest-capacity model's fit most --- but
+this is a hypothesis suggested by the numbers, not something these runs
+establish.
+
+\paragraph{GridSFM is the pipeline- and objective-sensitive one.} Its ratios
+above use the \emph{corrected} pandapower runs; the original-conversion numbers
+would measure the bug rather than the model. Read across all three settings the
+spread is stark. On case14 GridSFM goes 4.599e-2 (corrected pandapower,
+shared objective) \(\rightarrow\) 3.105e-2 (OPFData, shared) \(\rightarrow\)
+4.710e-3 (OPFData, native); on case118, 5.065e-2 \(\rightarrow\) 1.196e-1
+\(\rightarrow\) 2.080e-3. That is a spread of up to two orders of magnitude for
+one architecture on one grid, larger than any architecture-to-architecture
+difference reported anywhere in this document. \textbf{What GridSFM is worth
+cannot be stated without also stating the pipeline and the objective.}
+
+\section{Zero-shot transfer}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+ & \multicolumn{4}{c}{pandapower} & \multicolumn{2}{c}{OPFData} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-7}
+Released weights, no training & case14 & case118 & case300 & SimBench & case14 & case118 \\
+\midrule
+LUMINA \(\theta\) [deg]  & 12.87 & 34.42 & 21.83 & 38.96 & 10.03 & 12.69 \\
+GridSFM \(\theta\) [deg] & 11.18 & 38.73 & 169.24 & 39.29 & 0.76 & 18.04 \\
+LUMINA \(|V|\) RMSE      & 2.47e-2 & 3.74e-2 & 3.51e-2 & 6.15e-2 & 2.05e-2 & 2.14e-2 \\
+GridSFM \(|V|\) RMSE     & 6.40e-2 & 3.67e-2 & 4.69e-2 & 1.02e-1 & 3.35e-2 & 3.54e-2 \\
+\bottomrule
+\end{tabular}
+\caption{Neither model transfers reliably, but both do markedly better on
+OPFData than on the pandapower grids. GridSFM's \(0.76^\circ\) zero-shot angle
+on OPFData case14 is its single best result anywhere in this study.
+Its \(169^\circ\) on pandapower case300 is near-maximal error (angles wrap at
+\(180^\circ\)), i.e.\ that prediction carries no information.}
+\end{table}
+
+The zero-shot gap between pipelines is itself informative: both released models
+were pretrained on pglib-derived data, which is what OPFData contains, and
+neither was trained on locally generated pandapower snapshots or on SimBench's
+CGMES-derived grid. GridSFM's angle error falls from \(11.2^\circ\) to
+\(0.76^\circ\) on the same nominal grid (case14) purely by changing which
+pipeline produced the scenarios.
+
+\section{Findings}
+
+\paragraph{There is no objective-independent winner.} Under the shared
+voltage-only objective GridFM leads on every grid. Under each model's own
+objective, GridSFM wins case118 by \(11\times\) and case14 is a statistical tie
+between GridFM and GridSFM. The single most important result in this report is
+that \textbf{the ranking is a property of the training objective, not of the
+models}, and the earlier ``GridFM wins everywhere'' headline was an artifact of
+choosing an objective that matches GridFM's output structure.
+
+What survives objective changes is narrower: GridFM is the strongest surrogate
+\emph{when only voltages are supervised}, and it is the least sensitive to which
+objective is used (0.57--0.98\(\times\)). GridSFM is the strongest \emph{when
+trained as its authors intended}, and the most sensitive by two orders of
+magnitude. Which of these matters depends on whether a deployment can supply
+dispatch, cost and flow targets --- OPFData can; the pandapower backbone
+currently does not.
+
+One caveat still attaches to GridFM specifically: it is the only model never
+evaluated from a pretrained checkpoint, because none is published. The
+re-implementation caveat has been discharged --- the released model was run on
+the same grids and objectives (Section~\ref{sec:graphkit}) and changes no
+ranking.
+
+The qualification is not cosmetic. The training objective is voltage-only
+(\S\ref{par:supervision}), which is precisely what GridFM's architecture emits,
+while GridSFM's angle path depends on a generator head that this objective never
+trains, and LUMINA's dispatch head goes unread. Part of the measured margin is
+therefore attributable to the alignment between the loss and GridFM's output
+structure rather than to modelling capacity. The ranking of GridFM against
+LUMINA is nonetheless meaningful, since LUMINA's voltage head is independent of
+its unused dispatch head; the ranking against GridSFM is not
+(Section~\ref{sec:gridsfm}).
+
+GridFM also carries the largest parameter count: 20.0~M, against GridSFM's
+15.1~M and LUMINA's 2.4~M, and runs at batch 8 where the other two run at batch
+4. Neither has been controlled for.
+
+\paragraph{Grid size is the binding constraint under the shared objective.} On the
+pandapower pipeline GridFM's voltage RMSE runs 1.01e-3 \(\rightarrow\) 6.46e-3
+\(\rightarrow\) 2.85e-2 as the grid goes 14 \(\rightarrow\) 118
+\(\rightarrow\) 300 buses, a \(28\times\) degradation, and every other model
+degrades in step. At 300 buses no model is deployable. This is the result with
+the most practical weight and it is independent of model choice.
+
+\paragraph{LUMINA's pretrained weights give no reliable advantage.} This
+replicates cleanly across both pipelines and is the most robust negative result
+here. On pandapower, fine-tuning beats scratch on case14 (8.23e-3 vs 1.07e-2)
+but scratch wins on case118 (2.44e-2 vs 3.02e-2) and SimBench is a tie
+(1.2163e-1 vs 1.2173e-1). On OPFData the two are within 1\% on case14 (7.68e-3
+vs 7.77e-3) and scratch is \emph{ahead} on case118 (3.29e-2 vs 3.69e-2).
+Averaged over six grid/pipeline combinations the released weights are worth
+nothing once training is allowed. This is not because the checkpoint is already
+optimal --- its zero-shot errors are large --- but because 40 epochs of
+in-distribution training erases whatever it provides.
+
+\paragraph{LUMINA's magnitude transfers, its angle does not.} Zero-shot
+\(|V|\) stays within 2.1--6.2e-2 across all six combinations while \(\theta\)
+ranges 10--39\(^\circ\). This is structural: its sigmoid output scaling bounds
+the magnitude head into a supplied band, and nothing anchors the angle. Its bus
+schema also has no slot for bus voltage state, so it cannot observe an angle
+datum.
+
+\section{The pandapower GridSFM collapse was a data-conversion bug}
+\label{sec:gridsfm}
+
+Earlier revisions of this report treated GridSFM's frozen training as a property
+of the model, and offered the leaky clip bounding its heads as the leading
+explanation. \textbf{Both were wrong.} The cause has since been traced to the
+parquet conversion, and correcting it makes GridSFM train on every pandapower
+grid. The leaky-clip hypothesis is withdrawn.
+
+\paragraph{Root cause: \texttt{S\_demand} is not the load.} In the ACOPF-backbone
+parquets \texttt{S\_demand} (loaded as \texttt{S\_start}) stores the
+\emph{pre-OPF injection} --- base generation minus scenario load --- not the
+load. This was verified on case118 at pure-generator buses, where it equals the
+base setpoint exactly: bus 9 at 450.00~MW, bus 24 at 220.00~MW, bus 25 at
+314.00~MW.
+
+The consequence is that \(S_{\rm opf} - S_{\rm demand}\) is a \textbf{redispatch
+delta}, not a generation. Building the generation envelope on that delta puts
+its range under the system-wide slack correction, which on case118 is about
+\(-2271\)~MW. The resulting generation box has a \textbf{midpoint at
+\(-28\)~pu}, which is not a generation level any model can use.
+
+GridSFM builds its DC angle prior from the box midpoint. Fed a midpoint of
+\(-28\)~pu it saturates immediately, and the gradient norm is then exactly zero
+at every step --- which is precisely what the single-batch probe measured
+(15{,}148{,}227 parameters with \texttt{requires\_grad=True}, a finite loss, a
+connected autograd graph, and zero parameters receiving nonzero gradient). The
+probe was correct; its interpretation was not. GridFM and LUMINA do not consume
+the box midpoint, which is why the same malformed input degraded them without
+freezing them.
+
+\paragraph{The fix.} \texttt{convert\_opf\_backbone\_parquet.py -{}-gen\_box
+injection} builds the envelope on \(S_{\rm opf}\) itself, which is observable and
+physically bounded, while controllability is still decided by the delta --- a bus
+is controllable iff the OPF actually moves its injection. Testing
+\(|S_{\rm opf}|\) instead would flag every load bus and turn its power-balance
+equality into a free variable. The flag reaches the models as the per-bus column
+\texttt{Gen\_box\_injection}, read by \texttt{opf\_task.opf\_decision\_space}.
+
+\paragraph{The confirming experiment.} Re-running the pandapower suite on the
+corrected files reverses the failure completely:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lllll}
+\toprule
+Grid & Run & \multicolumn{2}{c}{original conversion} & corrected (\texttt{injbox}) \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-5}
+ & & frozen? & train loss & train loss \\
+\midrule
+case14  & pre-FT  & no  & 1.0825e-02 (ep 40) & 2.3993e-03 (ep 35), moving \\
+        & scratch & no  & 1.7211e-03 (ep 40) & 3.3299e-03 (ep 35), moving \\
+case118 & pre-FT  & \textbf{yes} (ep 26--28 bit-identical) & 4.6775e-01 & 5.1315e-03 (ep 33), moving \\
+        & scratch & \textbf{yes} (ep 23--25 bit-identical) & 3.9576e+00 & 1.3424e-01 (ep 30), moving \\
+case300 & pre-FT  & no, but not converging & 5.6870e+00 & 1.4837e-01 (ep 29), moving \\
+        & scratch & \textbf{yes} (ep 37--38) & 2.9180e+00 & 1.0378e-01 (ep 30), moving \\
+\bottomrule
+\end{tabular}
+\caption{GridSFM on the original versus the corrected conversion. \textbf{The
+decisive column is the third one.} Under the original conversion three runs are
+frozen --- the training loss is bit-identical across consecutive epochs, which
+is impossible under shuffled batches unless the weights are static. Under the
+corrected conversion no bit-identical epoch appears on any grid: the freeze is
+gone. The corrected runs were at epochs 29--35 of 40 at the time of writing, so
+their final test numbers are not yet available.}
+\end{table}
+
+\paragraph{Loss magnitudes are not comparable across the two conversions.} The
+loss contains a limit-violation term evaluated against the generation box, and
+the box is exactly what changed, so the two loss columns above measure different
+quantities. The large drops on case118 and case300 are mostly the disappearance
+of an enormous violation penalty against a box centred at \(-28\)~pu, not
+evidence that the model fits better. The clearest illustration is case14
+scratch, where the corrected loss is \emph{higher} (1.72e-3 \(\rightarrow\)
+3.33e-3): replacing a degenerate box with a real one gives the limit term
+something genuine to penalise. Only the freeze/no-freeze column supports a
+conclusion, and only the completed test metrics will support a capability claim.
+
+\paragraph{What this invalidates.} The consequences run wider than the GridSFM
+rows:
+
+\begin{itemize}\itemsep2pt
+\item \textbf{Every GridSFM row in Table~4 is an artifact of the bug}, not a
+measurement of GridSFM. This is a stronger statement than earlier revisions
+made: the rows are not merely ``runs that did not converge'', they are runs fed
+a decision space with a generation box centred 28~pu away from any feasible
+generation level.
+\item \textbf{The pandapower cost gaps inherit the same defect}, since the cost
+is evaluated against that box. This, and not an intrinsic instability of the
+metric, is why the original and corrected cost gaps in Table~3 differ so wildly.
+\item \textbf{GridFM and LUMINA's voltage columns largely survive}, because the
+malformed box entered their loss only through the limit-violation term and never
+through their architecture. Their corrected voltage RMSE moves by at most 13\%
+(Table~3), which is why the model ranking is unchanged.
+\end{itemize}
+
+\paragraph{This is not a GridSFM pathology.} On the corrected pandapower data
+GridSFM trains on all three grids; on OPFData, whose decision space is built from
+the case file's true \texttt{pmin}/\texttt{pmax} and never passed through this
+conversion, it trains on case14 and reaches 7.919e-3 pre-FT --- tied with LUMINA.
+GridSFM's sensitivity here is a real and reportable property: it is the only one
+of the three that consumes the generation box structurally, through its DC angle
+prior, so a malformed box disables it outright where the others merely degrade.
+That is a statement about coupling to input validity, not about capability.
+
+\paragraph{A separate, milder phenomenon remains on OPFData.} Three of the four
+OPFData GridSFM runs stop improving late in training: case14 scratch flattens at
+9.7975e-03 around epoch 38, case118 scratch at 2.2444e-02 around epoch 31, and
+case118 pre-FT diverges from 1.22e-01 to 2.6714e-01 and holds it from epoch 12.
+Both case118 runs report a \(|V|\) RMSE of exactly 3.3899e-02 despite different
+initialisations, and the pre-FT angle error sits at exactly \(20.000^\circ\),
+which together indicate a magnitude head that has gone constant against a bound.
+
+This is \emph{not} the mechanism described above --- OPFData's box is the true
+generator box, correctly applied --- and it is much milder: it appears late,
+after substantial convergence, rather than from the first step, and case14 pre-FT
+is unaffected. It has not been diagnosed. Given that the analogous failure in the
+other pipeline turned out to be a decision-space defect rather than a model
+defect, the OPFData decision space is the first place to look, and no conclusion
+about GridSFM should be drawn from these three runs in the meantime.
+
+\section{Status and limitations}
+
+\paragraph{Completeness.} A further 4 OPFData runs cover the released
+\texttt{gridfm\_graphkit} model (2 grids \(\times\) 2 objectives,
+Section~\ref{sec:graphkit}); all completed. All 20 earlier OPFData runs are
+complete: 10 under the shared
+objective and 10 under the native objectives, the latter run twice (alex and
+helma). On the pandapower pipeline the corrected-conversion (\texttt{injbox})
+suite is complete for GridFM and LUMINA on case14, case118 and case300, and for
+GridSFM on case14 (both inits) and case118 pre-FT. Three GridSFM runs ---
+case118 scratch and both case300 runs --- exceeded the 24\,h wall at epoch
+37--38 of 40 and never reached their own test pass; they were scored afterwards
+from their saved checkpoints and are marked \(\S\) in Table~5. SimBench has not
+been re-converted, so its rows remain original-conversion only and are not
+usable for GridSFM. Nothing in this report is now pending.
+
+\paragraph{Two defects found while collecting these results.} Both are fixed and
+both mattered. (i) The job label omitted the case, so case14 and case118 wrote
+to the same SLURM stdout/stderr files and overwrote each other's diagnostics;
+per-run training logs were unaffected. (ii) \texttt{-{}-EPOCHS 0} returns before
+the post-training checkpoint load, so an attempt to score a saved checkpoint
+silently evaluated the freshly initialised model instead --- it reported
+plausible-looking numbers that were simply the untrained network. A
+\texttt{-{}-resume\_state\_dict} flag was added to both drivers; it is the only
+correct way to score a checkpoint this project produces, since
+\texttt{-{}-init\_mode pretrained} routes through each repo's release loader and
+rejects the plain \texttt{state\_dict} these scripts save.
+
+\paragraph{Provenance of the cost column.} An earlier revision of this report
+carried cost gaps for the pandapower case14 and SimBench runs. Those figures
+could not be reproduced from the run logs --- those runs predate the masked OPF
+metric block --- so they have been removed rather than restated. The pandapower
+cost gaps that remain are quoted directly from the run logs, but they are
+evaluated against the malformed generation box, and
+Section~\ref{sec:metrics} explains why none of them should carry weight.
+
+\paragraph{Blocked.} The LVN~Heo1 OPF dataset remains blocked:
+\texttt{pp.runopp} does not converge on that CGMES-derived net even with the
+voltage band opened to \([0,2]\) and all thermal limits removed, and the failure
+survives switch fusion (3782\(\rightarrow\)1182 buses), zero-impedance repair,
+and both initialisations. Progressing it needs a more robust backend
+(PowerModels/IPOPT, which requires Julia) or repair of the CGMES import.
+
+\paragraph{Not measured.} Branch ratings are stored in both pipelines but not fed
+to the models; thermal violation is consequently not among the scored metrics and
+all three models lack the feature equally. OPFData was run without topological
+perturbations, so N-1 robustness is untested even though the dataset supports it.
+
+\paragraph{The main open item.} Every number here comes from voltage-only
+supervision. Both pipelines also carry the optimal dispatch and the objective,
+neither of which was used as a target, and two of the three models (LUMINA,
+GridSFM) expose generator heads that consequently received no gradient. A
+dispatch-supervised variant is implemented (\texttt{opf\_task.dispatch\_loss}
+and \texttt{gen\_head\_loss}, exposed as \texttt{-{}-dispatch\_weight} and
+\texttt{-{}-gen\_head\_weight} on all training scripts) and should be run before
+these results are used to rank the models on anything but voltage accuracy. It
+was investigated as a possible fix for GridSFM's frozen training and is not one
+--- a single-batch test shows gradients still do not reach \texttt{head\_Pg} when
+it is supervised directly. That question is now moot for the pandapower pipeline,
+where the freeze had a data cause and is resolved (Section~\ref{sec:gridsfm}).
+
+\end{document}

@@ -36,6 +36,16 @@ from train_valid_test_gridfm import (
     ppc_physics_loss,
     residual_distribution,
 )
+from opf_task import (
+    OPF_EXTRA_COLUMNS,
+    format_opf_metrics,
+    opf_decision_space,
+    opf_loss,
+    opf_metrics,
+    dispatch_loss,
+    gen_head_loss,
+    target_dispatch,
+)
 
 
 BUS_TYPE_PQ = 1
@@ -48,6 +58,22 @@ def parse_args():
         description="GridSFM released backbone on PPC branch-row parquet data",
     )
     parser.add_argument("--PARQUET", type=str, required=True)
+    parser.add_argument(
+        "--task",
+        choices=("pf", "opf"),
+        default="pf",
+        help="pf: predict voltages for a given injection. opf: predict the OPF "
+             "operating point from loads and the decision space only.",
+    )
+    parser.add_argument("--opf_limit_weight", type=float, default=1.0)
+    parser.add_argument("--opf_band_weight", type=float, default=0.0)
+    parser.add_argument("--dispatch_weight", type=float, default=0.0,
+                        help="Supervise the dispatch implied by the predicted voltages "
+                             "against the reference dispatch. Applies to every model.")
+    parser.add_argument("--gen_head_weight", type=float, default=0.0,
+                        help="Supervise the model's own generator head. Needed for "
+                             "GridSFM, whose angle prior is built from head_Pg through "
+                             "a detached path, so that head is otherwise never trained.")
     parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--log_to_file", action="store_true")
     parser.add_argument("--log_dir", type=str, default="./results/logs/gridsfm")
@@ -64,6 +90,16 @@ def parse_args():
         choices=("pretrained", "scratch"),
         default="pretrained",
         help="Use released GridSFM weights or random GridSFM backbone init.",
+    )
+    parser.add_argument(
+        "--resume_state_dict",
+        type=str,
+        default="",
+        # --init_mode pretrained goes through GridSFM's release loader, which
+        # rejects the plain state_dict this script saves as <run>_best.pt. And
+        # --EPOCHS 0 returns before the post-training checkpoint load. This flag
+        # is the only way to score a checkpoint this script produced.
+        help="Load a training-format state_dict into the freshly built model.",
     )
 
     parser.add_argument("--PER_UNIT", action="store_true")
@@ -211,7 +247,8 @@ def _make_branch_family(
     return edge_index, attr
 
 
-def make_gridsfm_graphs(batch_cpu: Dict[str, torch.Tensor], args) -> Tuple[List[HeteroData], torch.Tensor]:
+def make_gridsfm_graphs(batch_cpu: Dict[str, torch.Tensor], args,
+                        opf_space: Dict[str, torch.Tensor] = None) -> Tuple[List[HeteroData], torch.Tensor]:
     from gridsfm import prepare_for_inference
 
     sizes = batch_cpu["sizes"].long()
@@ -241,25 +278,47 @@ def make_gridsfm_graphs(batch_cpu: Dict[str, torch.Tensor], args) -> Tuple[List[
         bus_x = torch.zeros((n, 4), dtype=torch.float32)
         bus_x[:, 0] = vn_kv
         bus_x[:, 1] = bus_type.float()
-        bus_x[:, 2] = float(args.vmin)
-        bus_x[:, 3] = float(args.vmax)
+        if opf_space is not None and "Bus_vmin" in opf_space:
+            bus_x[:, 2] = opf_space["Bus_vmin"][bs].float()
+            bus_x[:, 3] = opf_space["Bus_vmax"][bs].float()
+        else:
+            bus_x[:, 2] = float(args.vmin)
+            bus_x[:, 3] = float(args.vmax)
         d["bus"].x = bus_x
         d["bus"].v_setpoint = Vstart[:, 0:1].clone()
 
-        gen_bus = torch.where((bus_type_ppc == 1) | (bus_type_ppc == 2))[0]
-        if gen_bus.numel() == 0:
-            gen_bus = torch.tensor([0], dtype=torch.long)
-        xg = torch.zeros((gen_bus.numel(), 11), dtype=torch.float32)
-        Pg0 = S.real[gen_bus].float()
-        Qg0 = S.imag[gen_bus].float()
-        p_margin = torch.maximum(Pg0.abs() * 0.5, torch.ones_like(Pg0) * 10.0)
-        q_margin = torch.maximum(Qg0.abs() * 0.5, torch.ones_like(Qg0) * 10.0)
-        xg[:, 0] = 1.0
-        xg[:, 2] = Pg0 - p_margin
-        xg[:, 3] = Pg0 + p_margin
-        xg[:, 5] = Qg0 - q_margin
-        xg[:, 6] = Qg0 + q_margin
-        xg[:, 7] = Vstart[gen_bus, 0]
+        if opf_space is not None:
+            # OPF: generators are the controllable buses, described by their real
+            # limits and cost slope. The dispatch itself is the answer, so pg/qg
+            # stay at zero.
+            ctrl = opf_space["Gen_controllable"][bs]
+            gen_bus = torch.where(ctrl)[0]
+            if gen_bus.numel() == 0:
+                gen_bus = torch.tensor([0], dtype=torch.long)
+            xg = torch.zeros((gen_bus.numel(), 11), dtype=torch.float32)
+            xg[:, 0] = 1.0
+            xg[:, 2] = opf_space["Gen_p_min"][bs][gen_bus].float()
+            xg[:, 3] = opf_space["Gen_p_max"][bs][gen_bus].float()
+            xg[:, 5] = opf_space["Gen_q_min"][bs][gen_bus].float()
+            xg[:, 6] = opf_space["Gen_q_max"][bs][gen_bus].float()
+            xg[:, 7] = Vstart[gen_bus, 0]
+            if "Gen_cost_c1" in opf_space:
+                xg[:, 9] = opf_space["Gen_cost_c1"][bs][gen_bus].float()
+        else:
+            gen_bus = torch.where((bus_type_ppc == 1) | (bus_type_ppc == 2))[0]
+            if gen_bus.numel() == 0:
+                gen_bus = torch.tensor([0], dtype=torch.long)
+            xg = torch.zeros((gen_bus.numel(), 11), dtype=torch.float32)
+            Pg0 = S.real[gen_bus].float()
+            Qg0 = S.imag[gen_bus].float()
+            p_margin = torch.maximum(Pg0.abs() * 0.5, torch.ones_like(Pg0) * 10.0)
+            q_margin = torch.maximum(Qg0.abs() * 0.5, torch.ones_like(Qg0) * 10.0)
+            xg[:, 0] = 1.0
+            xg[:, 2] = Pg0 - p_margin
+            xg[:, 3] = Pg0 + p_margin
+            xg[:, 5] = Qg0 - q_margin
+            xg[:, 6] = Qg0 + q_margin
+            xg[:, 7] = Vstart[gen_bus, 0]
         d["generator"].x = xg
         gen_idx = torch.arange(gen_bus.numel(), dtype=torch.long)
         d["generator", "generator_link", "bus"].edge_index = torch.stack([gen_idx, gen_bus], dim=0)
@@ -332,16 +391,27 @@ def make_gridsfm_graphs(batch_cpu: Dict[str, torch.Tensor], args) -> Tuple[List[
     return graphs, target
 
 
-def gridsfm_forward(model, batch_cpu: Dict[str, torch.Tensor], args, device) -> torch.Tensor:
+def gridsfm_forward(model, batch_cpu: Dict[str, torch.Tensor], args, device,
+                    opf_space: Dict[str, torch.Tensor] = None, return_gen: bool = False):
     from gridsfm import batch_data_list
 
-    graphs, _ = make_gridsfm_graphs(batch_cpu, args)
+    graphs, _ = make_gridsfm_graphs(batch_cpu, args, opf_space=opf_space)
     gbatch = batch_data_list(graphs, copy=False).to(device)
     out = model(gbatch)
     pred = out["bus"].pred
     theta = torch.atan2(torch.sin(pred[:, 0]), torch.cos(pred[:, 0]))
     mag = pred[:, 1]
-    return torch.stack([mag, theta], dim=-1).unsqueeze(0)
+    V = torch.stack([mag, theta], dim=-1).unsqueeze(0)
+    if not return_gen:
+        return V
+    # out['generator'].pred is [n_gen, 2] = (Pg, Qg). GridSFM's angle prior is
+    # built from head_Pg through a detached path, so this head only receives a
+    # gradient if it is supervised directly.
+    gen_pred = out["generator"].pred if "generator" in out.node_types else None
+    gen_bus = None
+    if ("generator", "generator_link", "bus") in out.edge_types:
+        gen_bus = out["generator", "generator_link", "bus"].edge_index[1].to(device)
+    return V, gen_pred, gen_bus
 
 
 def make_model(args, device):
@@ -380,6 +450,9 @@ def run():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device} torch={torch.__version__}")
     print(f"[run] {args.run_name}")
+    print(f"[task] {args.task}"
+          + (f" (limit_weight={args.opf_limit_weight} band_weight={args.opf_band_weight})"
+             if args.task == "opf" else ""))
     print(f"[data] PARQUET={args.PARQUET}")
     print(
         f"[data] PER_UNIT={args.PER_UNIT} target_S_base={args.target_S_base} "
@@ -403,6 +476,7 @@ def run():
         lazy_row_groups=args.lazy_parquet,
         row_group_cache_size=args.row_group_cache_size,
         complex_dtype=args.dataset_complex_dtype,
+        extra_binary_columns=OPF_EXTRA_COLUMNS if args.task == "opf" else None,
     )
     train_ds, val_ds, test_ds = split_dataset(
         dataset,
@@ -427,6 +501,9 @@ def run():
     test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
 
     model = make_model(args, device)
+    if getattr(args, "resume_state_dict", ""):
+        model.load_state_dict(torch.load(args.resume_state_dict, map_location=device))
+        print(f"[init] loaded state_dict: {args.resume_state_dict}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] trainable_params={n_params:,}")
 
@@ -437,6 +514,8 @@ def run():
     )
     best_val = float("inf")
     best_path = os.path.join(args.ckpt_dir, f"{args.run_name}_best.pt")
+
+    is_opf = args.task == "opf"
 
     def run_epoch(loader, train):
         model.train(train)
@@ -453,6 +532,7 @@ def run():
         n_conv = 0
         dp_values = []
         dq_values = []
+        opf_sums: Dict[str, float] = {}
 
         with torch.set_grad_enabled(train):
             for batch_cpu in loader:
@@ -491,22 +571,51 @@ def run():
                 )
 
                 target = batch_dev["V_newton"].float()
-                Vpred = gridsfm_forward(model, batch_cpu, args, device)
+                if is_opf:
+                    space_cpu = opf_decision_space(batch_cpu, batch_cpu["sizes"], torch.device("cpu"))
+                    space_dev = opf_decision_space(batch_dev, batch_cpu["sizes"], device)
+                else:
+                    space_cpu = space_dev = None
+                want_gen = is_opf and (args.gen_head_weight > 0.0)
+                if want_gen:
+                    Vpred, gen_pred, gen_bus = gridsfm_forward(
+                        model, batch_cpu, args, device, opf_space=space_cpu, return_gen=True)
+                else:
+                    Vpred = gridsfm_forward(model, batch_cpu, args, device, opf_space=space_cpu)
+                    gen_pred = gen_bus = None
 
                 dmag = Vpred[..., 0] - target[..., 0]
                 dang = angle_diff(Vpred[..., 1], target[..., 1])
                 mse_mag = torch.mean(dmag * dmag)
                 mse_ang = torch.mean(dang * dang)
                 mse = mse_mag + mse_ang
-                phys = ppc_physics_loss(
-                    Y_metric.to(torch.complex64),
-                    Vpred,
-                    Sstart_metric.to(torch.complex64),
-                    bus_type,
-                    form=args.physics_loss_form,
-                    huber_delta=args.physics_huber_delta,
-                )
+                if is_opf:
+                    phys = opf_loss(
+                        Y_metric, Vpred, Sstart_metric, space_dev,
+                        balance_weight=1.0,
+                        limit_weight=args.opf_limit_weight,
+                        band_weight=args.opf_band_weight,
+                        form=args.physics_loss_form,
+                    )
+                else:
+                    phys = ppc_physics_loss(
+                        Y_metric.to(torch.complex64),
+                        Vpred,
+                        Sstart_metric.to(torch.complex64),
+                        bus_type,
+                        form=args.physics_loss_form,
+                        huber_delta=args.physics_huber_delta,
+                    )
                 loss = args.mse_weight * mse + args.physics_weight * phys
+                if is_opf and (args.dispatch_weight > 0.0 or args.gen_head_weight > 0.0):
+                    tgt_gen = target_dispatch(batch_dev, space_dev, device)
+                    if tgt_gen is not None:
+                        if args.dispatch_weight > 0.0:
+                            loss = loss + args.dispatch_weight * dispatch_loss(
+                                Y_metric, Vpred, Sstart_metric, space_dev, tgt_gen)
+                        if args.gen_head_weight > 0.0 and gen_pred is not None:
+                            loss = loss + args.gen_head_weight * gen_head_loss(
+                                gen_pred, tgt_gen, gen_bus)
 
                 if train:
                     optim.zero_grad(set_to_none=True)
@@ -514,6 +623,11 @@ def run():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optim.step()
 
+                if is_opf:
+                    om = opf_metrics(Y_metric, Vpred.detach(), target, Sstart_metric,
+                                     space_dev, batch_cpu["sizes"])
+                    for key, value in om.items():
+                        opf_sums[key] = opf_sums.get(key, 0.0) + float(value) * B_eff
                 residual_metrics = compute_power_flow_residual_metrics(
                     Y_metric,
                     Vpred.detach(),
@@ -556,12 +670,19 @@ def run():
             "max_dp_mva": sum_max_dp_mva / denom,
             "max_dq_mva": sum_max_dq_mva / denom,
             "dist": dist,
+            "opf": {k: v / denom for k, v in opf_sums.items()} if opf_sums else None,
         }
 
     def fmt(prefix, m):
         rmse = math.sqrt(max(m["mse"], 0.0))
         rmse_mag = math.sqrt(max(m["mse_mag"], 0.0))
         rmse_ang_deg = math.sqrt(max(m["mse_ang"], 0.0)) * 180.0 / math.pi
+        if m.get("opf"):
+            return (
+                f"{prefix} loss {m['loss']:.4e} mse {m['mse']:.4e} phys {m['phys']:.4e} "
+                f"rmse {rmse:.4e} (mag {rmse_mag:.4e}, ang {rmse_ang_deg:.4e}deg) "
+                f"{format_opf_metrics(m['opf'])}"
+            )
         return (
             f"{prefix} loss {m['loss']:.4e} mse {m['mse']:.4e} phys {m['phys']:.4e} "
             f"rmse {rmse:.4e} (mag {rmse_mag:.4e}, ang {rmse_ang_deg:.4e}deg) "
@@ -613,6 +734,11 @@ def run():
         f" | dQinf : {te['max_dq_pu']:.4e} pu ({te['max_dq_mva']:.4e} MVAr)"
     )
     print(format_residual_distribution_compact(te["dist"]))
+    if te.get("opf"):
+        # The PF-convention residual above does not mask controllable buses, so
+        # on OPF data it charges correct redispatch as error. These are the
+        # metrics to read for the OPF task.
+        print("Final test-set OPF : " + format_opf_metrics(te["opf"]))
 
 
 if __name__ == "__main__":
