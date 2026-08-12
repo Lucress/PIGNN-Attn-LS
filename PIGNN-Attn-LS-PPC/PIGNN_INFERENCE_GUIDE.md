@@ -52,20 +52,20 @@ python predict_pignn.py \
 Output:
 
 ```
-[data] SimBench_scenarios.parquet: 36000 scenarios, 94 buses; scoring 36000
-[model] 65,282 parameters, K=40, d_hi=24, heads=8, layers=8, armijo=True, device=cuda
+[data] SimBench_scenarios.parquet: 36000 scenarios, 94 buses; scoring 400
+[model] 65,896 parameters, K=40, d_hi=24, heads=8, layers=8, armijo=True, device=cuda
 
-[accuracy vs the Newton reference]  n=36000 scenarios
-  |V| RMSE            1.4664e-03 pu
-  theta RMSE          6.6002e-02 deg
-  combined RMSE       1.8650e-03
+[accuracy vs the Newton reference]  n=400 scenarios
+  |V| RMSE            1.1762e-03 pu
+  theta RMSE          6.2692e-02 deg
+  combined RMSE       1.6064e-03
 
 [power-balance residual of the predicted state]  pu on 100 MVA
-  dP_inf 7.1700e-03   dQ_inf 8.5100e-03
-  mean|dP| 2.3000e-03   mean|dQ| 2.6900e-03
-  p95|dP|  5.6900e-03   p95|dQ|  7.1100e-03
+  dP_inf 1.2832e-02   dQ_inf 1.2981e-02
+  mean|dP| 1.3956e-03   mean|dQ| 1.5305e-03
+  p95|dP|  3.7052e-03   p95|dQ|  4.2540e-03
 
-[speed] ... ms/scenario
+[speed] 15.6s total, 39.0 ms/scenario
 ```
 
 Useful flags:
@@ -206,6 +206,11 @@ what the DC start already gives, the model is not contributing.
   `d_hi=64` diverging outright, so this is not a configuration to scale up
   casually.
 * The checkpoint is the best-validation epoch, not the last.
+
+**The bundled SimBench checkpoint is from epoch 12 of 40** -- the campaign was
+still running when it was packaged. The numbers above are what it gives today;
+replace the file from the run directory once training finishes and they will
+improve.
 
 There are no published weights for this model family anywhere; every checkpoint
 is trained from scratch.

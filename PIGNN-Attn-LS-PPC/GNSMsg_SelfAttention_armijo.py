@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_add, scatter_max
+from collate_blockdiag_optimized_complex_columns import ybus_matvec
+from known_operator_pf import adjoint_ybus_matvec
 
 
 # --------------------------- utils ---------------------------
@@ -45,9 +47,7 @@ def _segmented_softmax(logits_b_e_h: torch.Tensor, dst_e: torch.Tensor, num_node
 
 def _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask):
     Vc = v * torch.exp(1j * th)
-    if Y.dim() == 2:
-        Y = Y.unsqueeze(0)
-    Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)
+    Ic = ybus_matvec(Y, Vc)
     Sc = Vc * Ic.conj()
 
     DP = (P_set - Sc.real).masked_fill(slack_mask, 0.0)
@@ -285,6 +285,10 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         physics_norm_eps: float = 1e-6,
         physics_huber_delta: float = 1.0,
         physics_final_weight: float = 0.0,
+        solver_update_mode: str = "direct",
+        preconditioner_vm_step: float = 0.02,
+        preconditioner_va_step: float = 0.05,
+        preconditioner_log_clip: float = 5.0,
     ):
         super().__init__()
         self.K = K
@@ -306,6 +310,19 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         self.physics_norm_eps = physics_norm_eps
         self.physics_huber_delta = physics_huber_delta
         self.physics_final_weight = physics_final_weight
+        if solver_update_mode not in ("direct", "physics_preconditioner"):
+            raise ValueError(
+                f"Unknown solver_update_mode={solver_update_mode!r}; expected "
+                "'direct' or 'physics_preconditioner'."
+            )
+        if preconditioner_vm_step <= 0.0 or preconditioner_va_step <= 0.0:
+            raise ValueError("Preconditioner initial step scales must be positive.")
+        if preconditioner_log_clip <= 0.0:
+            raise ValueError("preconditioner_log_clip must be positive.")
+        self.solver_update_mode = solver_update_mode
+        self.preconditioner_vm_step = preconditioner_vm_step
+        self.preconditioner_va_step = preconditioner_va_step
+        self.preconditioner_log_clip = preconditioner_log_clip
 
         self.d_model = d_model if d_model is not None else d_hi
         self.n_heads = n_heads
@@ -313,7 +330,11 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         self.num_attn_layers = num_attn_layers
 
         self.bus_feat_extra_dim = int(bus_feat_extra_dim)
-        self.bus_feat_dim = 4 + self.bus_feat_extra_dim + d
+        # The integrated solver exposes the exact polar AC-PF gradient to the
+        # graph network.  The direct predictor retains the historical feature
+        # contract for checkpoint compatibility.
+        physics_gradient_dim = 2 if solver_update_mode == "physics_preconditioner" else 0
+        self.bus_feat_dim = 4 + physics_gradient_dim + self.bus_feat_extra_dim + d
         self.edge_feat_dim = 9   # <-- now includes tau + theta + is_trafo
 
         self.in_proj = nn.Linear(self.bus_feat_dim, self.d_model)
@@ -465,7 +486,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                     ))
                 Y = torch.stack(Ys, dim=0)
         else:
-            if Y.dim() == 2:
+            if Y.dim() == 2 and not Y.is_sparse:
                 Y = Y.unsqueeze(0)
 
         # -------- build sparse attention graph --------
@@ -523,13 +544,39 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         # ------------------------- K iterations -------------------------
         for k in range(self.K):
             Vc = v * torch.exp(1j * th)
-            Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)
+            Ic = ybus_matvec(Y, Vc)
             Sc = Vc * Ic.conj()
 
             DP = (P_set - Sc.real).masked_fill(slack_mask, 0.0)
             DQ = (Q_set - Sc.imag).masked_fill(slack_mask | pv_mask, 0.0)
 
-            bus_feat = torch.stack([v, th, DP, DQ], dim=-1)
+            grad_vm = None
+            grad_va = None
+            if self.solver_update_mode == "physics_preconditioner":
+                # Gradient of 0.5 * sum(F_P^2 + F_Q^2).  Using the sum form
+                # avoids making the physical direction shrink with bus count;
+                # the subsequent positive normalization is one scalar per
+                # batch item and therefore preserves the descent direction.
+                rP = (-DP).to(Vc.dtype)
+                rQ = (-DQ).to(Vc.dtype)
+                w = rP + 1j * rQ
+                g_complex = w * Ic + adjoint_ybus_matvec(Y, w.conj() * Vc)
+                phase = torch.exp(1j * th.to(Vc.dtype))
+                grad_vm = (g_complex.conj() * phase).real.to(v.dtype)
+                grad_va = (g_complex.conj() * (1j * Vc)).real.to(th.dtype)
+                grad_vm = grad_vm.masked_fill(slack_mask | pv_mask, 0.0)
+                grad_va = grad_va.masked_fill(slack_mask, 0.0)
+                grad_norm = torch.maximum(
+                    grad_vm.abs().amax(dim=-1, keepdim=True),
+                    grad_va.abs().amax(dim=-1, keepdim=True),
+                ).clamp_min(1e-12)
+                grad_vm = grad_vm / grad_norm
+                grad_va = grad_va / grad_norm
+
+            bus_parts = [v, th, DP, DQ]
+            if grad_vm is not None:
+                bus_parts.extend([grad_vm, grad_va])
+            bus_feat = torch.stack(bus_parts, dim=-1)
             if self.bus_feat_extra_dim > 0:
                 if vn_log is None:
                     extra = bus_feat.new_zeros(bus_feat.shape[:-1] + (self.bus_feat_extra_dim,))
@@ -556,8 +603,23 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                     x_new[b:b + 1] = xb
                 x = x_new
 
-            dth = self.theta_head[k](x).squeeze(-1)
-            dv  = self.v_head[k](x).squeeze(-1)
+            theta_raw = self.theta_head[k](x).squeeze(-1)
+            v_raw = self.v_head[k](x).squeeze(-1)
+            if self.solver_update_mode == "physics_preconditioner":
+                clip = self.preconditioner_log_clip
+                theta_scale = self.preconditioner_va_step * torch.exp(
+                    torch.clamp(theta_raw, -clip, clip)
+                )
+                v_scale = self.preconditioner_vm_step * torch.exp(
+                    torch.clamp(v_raw, -clip, clip)
+                )
+                # Positive diagonal graph preconditioner. Before projection,
+                # g^T d = -sum(scale * g^2) <= 0 by construction.
+                dth = -theta_scale * grad_va
+                dv = -v_scale * grad_vm
+            else:
+                dth = theta_raw
+                dv = v_raw
             dm  = torch.tanh(self.m_head[k](x))
             dm = F.layer_norm(dm, dm.shape[-1:])
 
@@ -668,7 +730,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         if self.pinn:
             if self.physics_final_weight != 0.0:
                 Vc = v * torch.exp(1j * th)
-                Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)
+                Ic = ybus_matvec(Y, Vc)
                 Sc = Vc * Ic.conj()
                 DP = (P_set - Sc.real).masked_fill(slack_mask, 0.0)
                 DQ = (Q_set - Sc.imag).masked_fill(slack_mask | pv_mask, 0.0)

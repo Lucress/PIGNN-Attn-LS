@@ -112,19 +112,39 @@ def main() -> int:
             b = collate_blockdiag([ds[i] for i in idx])
             bd = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in b.items()}
 
+            # The network runs in float32/complex64 while the dataset decodes in
+            # complex128 (kept for the residual diagnostics below, which suffer
+            # complex64 cancellation). Cast the model's inputs, not the metric
+            # ones -- this mirrors what the training driver does.
+            net = dict(bd)
+            for k in ("Branch_tau", "Branch_shift_deg"):
+                if torch.is_tensor(net.get(k)):
+                    net[k] = net[k].float()
+            for k in ("Branch_y_series_from", "Branch_y_series_to", "Branch_y_series_ft",
+                      "Branch_y_shunt_from", "Branch_y_shunt_to", "Y_shunt_bus",
+                      "S_start"):
+                if torch.is_tensor(net.get(k)):
+                    net[k] = net[k].to(torch.complex64)
+            net["V_start"] = net["V_start"].float()
+            net["Ybus"] = (bd["Ybus"].to(torch.complex64) if not bd["Ybus"].is_sparse
+                           else torch.sparse_coo_tensor(
+                               bd["Ybus"].coalesce().indices(),
+                               bd["Ybus"].coalesce().values().to(torch.complex64),
+                               bd["Ybus"].shape).coalesce())
+
             out = model(
-                bus_type=bd["bus_type"],
-                Branch_f_bus=bd["Branch_f_bus"], Branch_t_bus=bd["Branch_t_bus"],
-                Branch_status=bd["Branch_status"], Branch_tau=bd["Branch_tau"],
-                Branch_shift_deg=bd["Branch_shift_deg"],
-                Branch_y_series_from=bd["Branch_y_series_from"],
-                Branch_y_series_to=bd["Branch_y_series_to"],
-                Branch_y_series_ft=bd["Branch_y_series_ft"],
-                Branch_y_shunt_from=bd["Branch_y_shunt_from"],
-                Branch_y_shunt_to=bd["Branch_y_shunt_to"],
-                Is_trafo=bd.get("Is_trafo"),
-                Y=bd["Ybus"], S=bd["S_start"], V0=bd["V_start"],
-                Y_shunt_bus=bd.get("Y_shunt_bus"),
+                bus_type=net["bus_type"],
+                Branch_f_bus=net["Branch_f_bus"], Branch_t_bus=net["Branch_t_bus"],
+                Branch_status=net["Branch_status"], Branch_tau=net["Branch_tau"],
+                Branch_shift_deg=net["Branch_shift_deg"],
+                Branch_y_series_from=net["Branch_y_series_from"],
+                Branch_y_series_to=net["Branch_y_series_to"],
+                Branch_y_series_ft=net["Branch_y_series_ft"],
+                Branch_y_shunt_from=net["Branch_y_shunt_from"],
+                Branch_y_shunt_to=net["Branch_y_shunt_to"],
+                Is_trafo=net.get("Is_trafo"),
+                Y=net["Ybus"], S=net["S_start"], V0=net["V_start"],
+                Y_shunt_bus=net.get("Y_shunt_bus"),
             )
             V = (out[0] if isinstance(out, (tuple, list)) else out)[..., :2]
 
@@ -151,12 +171,18 @@ def main() -> int:
                 sizes = b["sizes"].tolist(); off = 0
                 for j, sz in enumerate(sizes):
                     sl = slice(off, off + sz); off += sz
+                    # Mask per scenario exactly as the aggregate does. Without
+                    # this the slack bus dominates every row and the column
+                    # reads ~1000x the pooled number it is supposed to detail.
+                    pm = p_mask[0, sl]; qm = q_mask[0, sl]
+                    rp = resid.real[0, sl][pm]
+                    rq = resid.imag[0, sl][qm]
                     rows.append((
                         start + j,
                         float((dmag[0, sl] ** 2).mean() ** 0.5),
                         float((dang[0, sl] ** 2).mean() ** 0.5) * 180 / math.pi,
-                        float(resid.real[0, sl].abs().max()),
-                        float(resid.imag[0, sl].abs().max()),
+                        float(rp.abs().max()) if rp.numel() else 0.0,
+                        float(rq.abs().max()) if rq.numel() else 0.0,
                     ))
             done += len(list(idx))
 
