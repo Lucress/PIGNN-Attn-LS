@@ -55,14 +55,18 @@ def add_known_operator_args(parser):
     group.add_argument(
         "--kol_eval_steps",
         type=int,
-        default=100,
+        default=1000,
         help="Maximum DPF steps at validation/test time; graphs stop independently.",
     )
     group.add_argument(
         "--kol_lr",
         type=float,
-        default=1e-3,
-        help="Voltage-state learning rate inside the known operator.",
+        default=0.003377,
+        help=(
+            "Voltage-state learning rate inside the known operator. The "
+            "default matches the author's reference Adam configuration; "
+            "their very-large-grid experiments use 1e-4 instead."
+        ),
     )
     group.add_argument(
         "--kol_optimizer",
@@ -76,9 +80,22 @@ def add_known_operator_args(parser):
         default=1e-6,
         help="Per-graph max masked P/Q mismatch required for certification (pu).",
     )
-    group.add_argument("--kol_beta1", type=float, default=0.9)
-    group.add_argument("--kol_beta2", type=float, default=0.999)
+    group.add_argument("--kol_beta1", type=float, default=0.979681)
+    group.add_argument("--kol_beta2", type=float, default=0.963442)
     group.add_argument("--kol_eps", type=float, default=1e-8)
+    group.add_argument(
+        "--kol_scheduler",
+        choices=("author_plateau", "off"),
+        default="author_plateau",
+        help=(
+            "Learning-rate scheduler for the adaptive evaluation solve. "
+            "author_plateau matches the reference DPF Adam configuration."
+        ),
+    )
+    group.add_argument("--kol_scheduler_factor", type=float, default=0.547191)
+    group.add_argument("--kol_scheduler_patience", type=int, default=41)
+    group.add_argument("--kol_scheduler_threshold", type=float, default=0.067321)
+    group.add_argument("--kol_scheduler_cooldown", type=int, default=97)
     group.add_argument(
         "--kol_vmin",
         type=float,
@@ -133,13 +150,18 @@ def add_known_operator_args(parser):
 @dataclass(frozen=True)
 class DifferentiablePFConfig:
     train_steps: int = 3
-    eval_steps: int = 100
-    lr: float = 1e-3
+    eval_steps: int = 1000
+    lr: float = 0.003377
     optimizer: str = "adam"
     tol: float = 1e-6
-    beta1: float = 0.9
-    beta2: float = 0.999
+    beta1: float = 0.979681
+    beta2: float = 0.963442
     eps: float = 1e-8
+    scheduler: str = "author_plateau"
+    scheduler_factor: float = 0.547191
+    scheduler_patience: int = 41
+    scheduler_threshold: float = 0.067321
+    scheduler_cooldown: int = 97
     vmin: float = 0.5
     vmax: float = 1.5
     grad_clip: float = 0.0
@@ -158,6 +180,14 @@ class DifferentiablePFConfig:
             raise ValueError("KOL Adam beta values must lie in [0, 1)")
         if self.eps <= 0.0:
             raise ValueError("--kol_eps must be positive")
+        if self.scheduler not in ("author_plateau", "off"):
+            raise ValueError(f"Unsupported KOL scheduler: {self.scheduler!r}")
+        if not 0.0 < self.scheduler_factor < 1.0:
+            raise ValueError("KOL scheduler factor must lie in (0, 1)")
+        if self.scheduler_patience < 0 or self.scheduler_cooldown < 0:
+            raise ValueError("KOL scheduler patience/cooldown cannot be negative")
+        if not 0.0 <= self.scheduler_threshold < 1.0:
+            raise ValueError("KOL scheduler threshold must lie in [0, 1)")
         if self.vmin <= 0.0 or self.vmin >= self.vmax:
             raise ValueError("KOL voltage guards require 0 < vmin < vmax")
         if self.grad_clip < 0.0:
@@ -174,6 +204,11 @@ def config_from_args(args) -> DifferentiablePFConfig:
         beta1=float(args.kol_beta1),
         beta2=float(args.kol_beta2),
         eps=float(args.kol_eps),
+        scheduler=str(args.kol_scheduler),
+        scheduler_factor=float(args.kol_scheduler_factor),
+        scheduler_patience=int(args.kol_scheduler_patience),
+        scheduler_threshold=float(args.kol_scheduler_threshold),
+        scheduler_cooldown=int(args.kol_scheduler_cooldown),
         vmin=float(args.kol_vmin),
         vmax=float(args.kol_vmax),
         grad_clip=float(args.kol_grad_clip),
@@ -197,6 +232,7 @@ def known_operator_tag(args) -> str:
     return (
         f"kol-dpf-tr{args.kol_train_steps}-ev{args.kol_eval_steps}"
         f"-lr{args.kol_lr:g}-tol{args.kol_tol:g}-{args.kol_optimizer}"
+        f"-{args.kol_scheduler}"
     )
 
 
@@ -278,7 +314,12 @@ def power_flow_residual_loss(
     *,
     sizes: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Mean of per-graph half squared masked AC-PF residuals."""
+    """Mean of per-graph masked AC-PF squared residuals.
+
+    This is exactly the ``torch.nn.MSELoss`` objective used by the reference
+    DPF implementation, averaged per independent grid before the outer batch
+    mean.
+    """
     dP, dQ, p_mask, q_mask = power_flow_mismatch(Y, V, Sset, bus_type)
     graph_losses = []
     for b, sl in _graph_slices(V, sizes):
@@ -291,7 +332,7 @@ def power_flow_residual_loss(
             parts.append(dQ[b, sl][qm])
         if parts:
             residual = torch.cat(parts)
-            graph_losses.append(0.5 * torch.mean(residual.square()))
+            graph_losses.append(torch.mean(residual.square()))
     if not graph_losses:
         return V.sum() * 0.0
     return torch.stack(graph_losses).mean()
@@ -322,11 +363,11 @@ def _graph_loss_scales(
     q_mask: torch.Tensor,
     sizes: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Node-wise scale for a mean of per-graph half squared residuals."""
+    """Node-wise derivative scale for the reference per-graph MSE."""
     if sizes is None:
         n_graphs = p_mask.shape[0]
         n_equations = (p_mask.sum(dim=-1) + q_mask.sum(dim=-1)).clamp_min(1)
-        return (1.0 / (n_graphs * n_equations)).to(dtype=torch.float64).view(-1, 1)
+        return (2.0 / (n_graphs * n_equations)).to(dtype=torch.float64).view(-1, 1)
 
     scales = []
     offset = 0
@@ -335,7 +376,7 @@ def _graph_loss_scales(
         size = int(size)
         sl = slice(offset, offset + size)
         n_equations = (p_mask[0, sl].sum() + q_mask[0, sl].sum()).clamp_min(1)
-        scale = 1.0 / (n_graphs * n_equations)
+        scale = 2.0 / (n_graphs * n_equations)
         scales.append(scale.expand(size))
         offset += size
     return torch.cat(scales).view(1, -1).to(dtype=torch.float64)
@@ -388,7 +429,7 @@ def power_flow_loss_and_gradient(
             parts.append(dQ[b, sl][qm])
         if parts:
             r = torch.cat(parts)
-            graph_losses.append(0.5 * r.square().mean())
+            graph_losses.append(r.square().mean())
     loss = torch.stack(graph_losses).mean() if graph_losses else V.sum() * 0.0
 
     scale = _graph_loss_scales(p_mask, q_mask, sizes).to(device=V.device, dtype=real_dtype)
@@ -445,7 +486,8 @@ class DifferentiablePowerFlow(nn.Module):
         c = self.config
         return (
             f"optimizer={c.optimizer}, train_steps={c.train_steps}, "
-            f"eval_steps={c.eval_steps}, lr={c.lr:g}, tol={c.tol:g}"
+            f"eval_steps={c.eval_steps}, lr={c.lr:g}, tol={c.tol:g}, "
+            f"scheduler={c.scheduler}"
         )
 
     def forward(
@@ -509,6 +551,10 @@ class DifferentiablePowerFlow(nn.Module):
             m_va = torch.zeros_like(va)
             v_vm = torch.zeros_like(vm)
             v_va = torch.zeros_like(va)
+            current_lr = c.lr
+            scheduler_best = float("inf")
+            scheduler_bad_epochs = 0
+            scheduler_cooldown = 0
 
             for step in range(1, steps + 1):
                 if not differentiable:
@@ -519,7 +565,7 @@ class DifferentiablePowerFlow(nn.Module):
                     if not bool(active.any()):
                         break
 
-                _, grad_vm, grad_va = power_flow_loss_and_gradient(
+                current_loss, grad_vm, grad_va = power_flow_loss_and_gradient(
                     Y, state(), Sset, bus_type, sizes=sizes
                 )
                 if c.first_order:
@@ -542,11 +588,18 @@ class DifferentiablePowerFlow(nn.Module):
                     v_va = c.beta2 * v_va + (1.0 - c.beta2) * grad_va.square()
                     bias1 = 1.0 - c.beta1 ** step
                     bias2 = 1.0 - c.beta2 ** step
-                    delta_vm = c.lr * (m_vm / bias1) / (torch.sqrt(v_vm / bias2) + c.eps)
-                    delta_va = c.lr * (m_va / bias1) / (torch.sqrt(v_va / bias2) + c.eps)
+                    delta_vm = current_lr * (m_vm / bias1) / (torch.sqrt(v_vm / bias2) + c.eps)
+                    delta_va = current_lr * (m_va / bias1) / (torch.sqrt(v_va / bias2) + c.eps)
                 else:
-                    delta_vm = c.lr * grad_vm
-                    delta_va = c.lr * grad_va
+                    delta_vm = current_lr * grad_vm
+                    delta_va = current_lr * grad_va
+
+                # A graph that has met the residual certificate must remain
+                # frozen. Masking only the current gradient is insufficient
+                # for Adam because old first/second moments otherwise keep
+                # moving the voltage after convergence.
+                delta_vm = delta_vm.masked_fill(~node_active, 0.0)
+                delta_va = delta_va.masked_fill(~node_active, 0.0)
 
                 vm = torch.where(vm_free, (vm - delta_vm).clamp(c.vmin, c.vmax), Vfixed_work[..., 0])
                 va_candidate = va - delta_va
@@ -559,6 +612,24 @@ class DifferentiablePowerFlow(nn.Module):
                 if not differentiable:
                     vm = vm.detach()
                     va = va.detach()
+
+                    if c.scheduler == "author_plateau":
+                        metric = float(current_loss.detach().item())
+                        better = metric < scheduler_best * (1.0 - c.scheduler_threshold)
+                        if better:
+                            scheduler_best = metric
+                            scheduler_bad_epochs = 0
+                        else:
+                            scheduler_bad_epochs += 1
+                        if scheduler_cooldown > 0:
+                            scheduler_cooldown -= 1
+                            scheduler_bad_epochs = 0
+                        if scheduler_bad_epochs > c.scheduler_patience:
+                            next_lr = current_lr * c.scheduler_factor
+                            if current_lr - next_lr > 1e-8:
+                                current_lr = next_lr
+                            scheduler_cooldown = c.scheduler_cooldown
+                            scheduler_bad_epochs = 0
 
             output = state()
             final_max = power_flow_max_mismatch(
