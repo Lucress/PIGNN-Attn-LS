@@ -37,6 +37,12 @@ from opf_task import (
     gen_head_loss,
     target_dispatch,
 )
+from known_operator_pf import (
+    add_known_operator_args,
+    build_known_operator,
+    format_known_operator_diagnostics,
+    known_operator_tag,
+)
 
 
 # GridFM-GraphKit feature column layout.
@@ -95,6 +101,14 @@ def parse_args():
         description="GridFM HGNS surrogate on PPC branch-row parquet data",
     )
     parser.add_argument("--PARQUET", type=str, required=True)
+    parser.add_argument(
+        "--pin_known",
+        action="store_true",
+        help="Power flow only: hold |V| at PV/slack and the angle at the slack "
+             "to their given input values instead of predicting a correction "
+             "there. Physically correct for PF; off by default so the first "
+             "campaign stays reproducible.",
+    )
     parser.add_argument(
         "--gridfm_impl",
         choices=("mirror", "graphkit"),
@@ -193,6 +207,7 @@ def parse_args():
     parser.add_argument("--convergence_tol_pu", type=float, default=1e-6)
     parser.add_argument("--vmin", type=float, default=0.5)
     parser.add_argument("--vmax", type=float, default=1.5)
+    add_known_operator_args(parser)
     return parser.parse_args()
 
 
@@ -703,6 +718,7 @@ class GridFMHeteroSurrogate(nn.Module):
         vmin=0.5,
         vmax=1.5,
         out_bus_dim=2,
+        pin_known=False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -714,6 +730,15 @@ class GridFMHeteroSurrogate(nn.Module):
         # (PG, QG, PD, QD) so GridFM's own MaskedReconstructionMSE, which
         # supervises all six quantities, can be used -- see native_loss.py.
         self.out_bus_dim = out_bus_dim
+        # In AC power flow |V| is an input at PV and slack buses and the angle
+        # is an input at the slack; only the remaining quantities are unknown.
+        # With pin_known the head's correction is masked off at those buses so
+        # the given values pass through exactly. Left False by default because
+        # the first PF campaign ran without it and its numbers must stay
+        # reproducible; measured on case118, not pinning moved |V| away from
+        # the given value by 2.3e-3 pu on average (max 1.6e-2) at the 46% of
+        # buses where it was already known, and the slack angle by 0.15 deg.
+        self.pin_known = pin_known
 
         self.input_proj_bus = nn.Sequential(
             nn.Linear(input_bus_dim, hidden_size),
@@ -801,8 +826,17 @@ class GridFMHeteroSurrogate(nn.Module):
             h_gen = h_gen + out_gen if h_gen.shape == out_gen.shape else out_gen
 
         delta = self.mlp_bus(h_bus)
-        v = torch.clamp(x_dict["bus"][:, VM_H] + delta[:, 0], self.vmin, self.vmax)
-        th = x_dict["bus"][:, VA_H] + delta[:, 1]
+        dv, dth = delta[:, 0], delta[:, 1]
+        if self.pin_known:
+            # PQ_H / REF_H are one-hots the feature builder already sets, so no
+            # extra input is needed. |V| is free only at PQ; the angle is free
+            # everywhere except the reference bus.
+            is_pq = x_dict["bus"][:, PQ_H] > 0.5
+            is_ref = x_dict["bus"][:, REF_H] > 0.5
+            dv = torch.where(is_pq, dv, torch.zeros_like(dv))
+            dth = torch.where(is_ref, torch.zeros_like(dth), dth)
+        v = torch.clamp(x_dict["bus"][:, VM_H] + dv, self.vmin, self.vmax)
+        th = x_dict["bus"][:, VA_H] + dth
         th = torch.atan2(torch.sin(th), torch.cos(th))
         V = torch.stack([v, th], dim=-1).unsqueeze(0)
         if self.out_bus_dim <= 2:
@@ -819,8 +853,17 @@ def run():
     args = parse_args()
     set_seed(args.seed_value)
 
+    if args.task != "pf" and args.kol_pf_mode != "off":
+        raise ValueError(
+            "--kol_pf_mode is an AC power-flow feasibility operator and cannot "
+            "be applied to --task opf, where generator dispatch is a decision."
+        )
+
     if not args.run_name:
-        args.run_name = f"gridfm_hgns_{Path(args.PARQUET).stem}"
+        args.run_name = (
+            f"gridfm_{args.gridfm_impl}_{known_operator_tag(args)}_"
+            f"{Path(args.PARQUET).stem}"
+        )
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)
     os.makedirs("./results/plots", exist_ok=True)
@@ -852,6 +895,7 @@ def run():
         f"[loss] mse_weight={args.mse_weight} physics_weight={args.physics_weight} "
         f"physics_form={args.physics_loss_form}"
     )
+    print(f"[known-operator] {known_operator_tag(args)} raw_loss_weight={args.kol_raw_loss_weight:g}")
 
     is_opf = args.task == "opf"
     dataset = ChanghunDataset(
@@ -907,6 +951,7 @@ def run():
             zero_init_head=args.zero_init_head,
             vmin=args.vmin,
             vmax=args.vmax,
+            pin_known=(args.pin_known and not is_opf),
         ).to(device)
     if args.init_checkpoint:
         ckpt = torch.load(args.init_checkpoint, map_location=device)
@@ -920,6 +965,10 @@ def run():
         )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] trainable_params={n_params:,}")
+    known_operator = build_known_operator(args)
+    if known_operator is not None:
+        known_operator = known_operator.to(device)
+        print(f"[known-operator] {known_operator}")
 
     optim = torch.optim.AdamW(
         model.parameters(),
@@ -945,6 +994,10 @@ def run():
         dp_values = []
         opf_sums = {}
         dq_values = []
+        kol_initial_values = []
+        kol_final_values = []
+        kol_converged_values = []
+        kol_iteration_values = []
 
         with torch.set_grad_enabled(train):
             for batch in loader:
@@ -994,7 +1047,7 @@ def run():
                 )
                 if args.gridfm_impl == "graphkit":
                     from gridfm_graphkit_adapter import forward_graphkit_parquet
-                    Vpred = forward_graphkit_parquet(
+                    Vraw = forward_graphkit_parquet(
                         model, batch_dev, device,
                         task_name=("OptimalPowerFlow" if is_opf else "PowerFlow"),
                         feature_transform=args.feature_transform,
@@ -1002,7 +1055,21 @@ def run():
                         opf_space=space_dev,
                     )
                 else:
-                    Vpred = model(x_dict, edge_index_dict, edge_attr_dict)
+                    Vraw = model(x_dict, edge_index_dict, edge_attr_dict)
+
+                kol_diag = None
+                if known_operator is not None:
+                    Vpred, kol_diag = known_operator(
+                        Vraw,
+                        Y_metric,
+                        Sstart_metric,
+                        bus_type,
+                        V_fixed=batch_dev["V_start"],
+                        sizes=n_nodes,
+                        differentiable=train,
+                    )
+                else:
+                    Vpred = Vraw
 
                 target_b = target.unsqueeze(0)
                 dmag = Vpred[..., 0] - target_b[..., 0]
@@ -1028,6 +1095,21 @@ def run():
                         huber_delta=args.physics_huber_delta,
                     )
                 loss = args.mse_weight * mse + args.physics_weight * phys
+                if known_operator is not None and args.kol_raw_loss_weight > 0.0:
+                    raw_dmag = Vraw[..., 0] - target_b[..., 0]
+                    raw_dang = angle_diff(Vraw[..., 1], target_b[..., 1])
+                    raw_mse = torch.mean(raw_dmag * raw_dmag) + torch.mean(raw_dang * raw_dang)
+                    raw_phys = ppc_physics_loss(
+                        Y_metric.to(torch.complex64),
+                        Vraw,
+                        Sstart_metric.to(torch.complex64),
+                        bus_type,
+                        form=args.physics_loss_form,
+                        huber_delta=args.physics_huber_delta,
+                    )
+                    loss = loss + args.kol_raw_loss_weight * (
+                        args.mse_weight * raw_mse + args.physics_weight * raw_phys
+                    )
                 if is_opf and args.dispatch_weight > 0.0:
                     # GridFM has no generator head, so only the implied dispatch
                     # can be supervised; --gen_head_weight is a no-op here.
@@ -1072,12 +1154,25 @@ def run():
                     & (residual_metrics["max_dq_pu"] < args.convergence_tol_pu)
                 )
                 n_conv += int(conv.sum().item())
+                if kol_diag is not None:
+                    kol_initial_values.append(kol_diag["initial_max_mismatch"].detach().cpu())
+                    kol_final_values.append(kol_diag["final_max_mismatch"].detach().cpu())
+                    kol_converged_values.append(kol_diag["converged"].detach().cpu())
+                    kol_iteration_values.append(kol_diag["iterations"].detach().cpu())
 
         denom = max(n_graphs, 1)
         dist = residual_distribution(dp_values, dq_values, args.residual_tol_pu)
         dist["convergence_rate"] = n_conv / denom
         dist["n_converged"] = n_conv
         dist["n_cases"] = n_graphs
+        kol_summary = None
+        if kol_final_values:
+            kol_summary = {
+                "initial_max_mismatch": torch.cat(kol_initial_values),
+                "final_max_mismatch": torch.cat(kol_final_values),
+                "converged": torch.cat(kol_converged_values),
+                "iterations": torch.cat(kol_iteration_values),
+            }
         return {
             "loss": sum_loss / denom,
             "mse": sum_mse / denom,
@@ -1090,6 +1185,7 @@ def run():
             "max_dq_mva": sum_max_dq_mva / denom,
             "dist": dist,
             "opf": {k: v / denom for k, v in opf_sums.items()} if opf_sums else None,
+            "kol": kol_summary,
         }
 
     def fmt(prefix, m):
@@ -1107,7 +1203,8 @@ def run():
             f"rmse {rmse:.4e} (mag {rmse_mag:.4e}, ang {rmse_ang_deg:.4e}deg) "
             f"(dPinf {m['max_dp_pu']:.3e} pu, dQinf {m['max_dq_pu']:.3e} pu; "
             f"{m['max_dp_mva']:.3e} MW, {m['max_dq_mva']:.3e} MVAr) "
-            f"{format_residual_distribution_compact(m['dist'])}"
+            f"{format_residual_distribution_compact(m['dist'])} "
+            f"{format_known_operator_diagnostics(m.get('kol'))}"
         )
 
     print("Initial metrics before training:")
