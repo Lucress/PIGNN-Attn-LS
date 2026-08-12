@@ -455,3 +455,4 @@ CUDA OOM appears.
 No training_log.txt appears.
 Repeated "physics loss detached" appears for Armijo runs.
 ```
+#
