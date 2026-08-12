@@ -53,6 +53,13 @@ venv/
 # ...but keep the inspection helpers that live next to the generated parquet
 !/ScenarioSynthesis_PPC/out/*.py
 /PIGNN-Attn-LS-PPC/results/ckpt/
+# Downloaded CGMES grid models and their debug dumps (tens of MB each; the
+# ENTSO-E RealGridTest EQ profile alone is 64 MB, past GitHub's 50 MB warning)
+/ScenarioSynthesis_PPC/CGMES/
+/ScenarioSynthesis_PPC/CGMES_LVN_Debug/
+# ...but keep the scripts that read them
+!/ScenarioSynthesis_PPC/CGMES/**/*.py
+!/ScenarioSynthesis_PPC/CGMES_LVN_Debug/**/*.py
 
 # ---------------------------------------------------------------------------
 # Run artifacts: Slurm output, training logs, per-run metric dumps
@@ -70,6 +77,15 @@ terminal_log_capture*.txt
 !/sbatch/previous/
 /PIGNN-Attn-LS-PPC/results/logs/
 /PIGNN-Attn-LS-PPC/results/plots/
+
+# ---------------------------------------------------------------------------
+# Slurm / SSH job and dispatch scripts. These are machine- and run-specific
+# (node names, partitions, absolute paths, timestamps) and are regenerated per
+# experiment, so they are not worth versioning. The handful committed before
+# this rule stay tracked; git only skips new ones. Use `git add -f` to
+# deliberately version a particular script.
+# ---------------------------------------------------------------------------
+*.sh
 
 # ---------------------------------------------------------------------------
 # Large binary documents and rendered figures
