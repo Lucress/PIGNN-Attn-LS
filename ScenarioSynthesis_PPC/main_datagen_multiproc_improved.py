@@ -108,6 +108,22 @@ SCENARIO_PRESETS = {
         mag_jitter_pq=0.002,
         line_outage_prob=0.0,
     ),
+    # Phase-0 backbone: broad load/operating-point coverage, FIXED Y-bus.
+    # B-level load knobs (best balance of coverage vs. NR convergence) with
+    # topology/admittance OFF, so datasets stay share_grid-compatible and run
+    # on the largest grids. Pair with --drop_nonconverged for clean labels.
+    "backbone": dict(
+        load_scale_range=(0.60, 1.40),   # ±40% — light → heavy → near-collapse
+        scale_gen_with_load=True,
+        jitter_load=0.10,                # σ_P
+        jitter_load_q=0.15,              # σ_Q > σ_P (reactive less predictable)
+        jitter_gen=0.05,                 # σ_G
+        pv_vset_range=(0.95, 1.05),      # realistic generator setpoint band
+        rand_u_start=True,
+        angle_jitter_deg=5.0,
+        mag_jitter_pq=0.02,
+        line_outage_prob=0.0,            # Phase 0: NO topology change (Y-bus fixed)
+    ),
     "no_change": dict(
         load_scale_range=None,
         scale_gen_with_load=True,
@@ -701,6 +717,43 @@ def parse_args():
     group.add_argument("--no_save_y_matrix", dest="save_y_matrix", action="store_false", help="Do not save Y_matrix")
     parser.set_defaults(save_y_matrix=True)
 
+    # Start-point jitter is OPT-IN.
+    #
+    # Independent per-bus angle noise corrupts branch angle differences, which
+    # is what the NR basin actually depends on: +/-5 deg per bus injects branch
+    # |dtheta| 2-4x larger than the physical DC solution and pushes the start
+    # outside the basin. Measured effect on custom-NR convergence at +/-40%
+    # load (case89pegase 3.3% jittered vs 100% clean; case_illinois200 0.0% vs
+    # 100%). The scenario preset value is therefore NOT used unless the flag is
+    # given explicitly, so a plain run always starts from the clean start point.
+    jgroup = parser.add_mutually_exclusive_group()
+    jgroup.add_argument(
+        "--rand_u_start",
+        dest="rand_u_start",
+        action="store_true",
+        help="Add jitter to the initial voltage (opt-in; overrides the preset).",
+    )
+    jgroup.add_argument(
+        "--no_rand_u_start",
+        dest="rand_u_start",
+        action="store_false",
+        help="Use the clean start point exactly as built by --start_mode (default).",
+    )
+    parser.set_defaults(rand_u_start=False)
+
+    parser.add_argument(
+        "--angle_jitter_deg",
+        type=float,
+        default=None,
+        help="Override preset angle jitter [deg]. Only used with --rand_u_start.",
+    )
+    parser.add_argument(
+        "--mag_jitter_pq",
+        type=float,
+        default=None,
+        help="Override preset PQ magnitude jitter [fraction]. Only used with --rand_u_start.",
+    )
+
     parser.add_argument(
         "--scenario_level",
         type=str,
@@ -754,6 +807,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_start_jitter(args):
+    """Effective (rand_u_start, angle_jitter_deg, mag_jitter_pq).
+
+    rand_u_start is CLI-only and defaults to False, so the preset cannot switch
+    jitter on implicitly. Magnitudes fall back to the preset when the flag is
+    given without explicit overrides. Single source of truth for both the run
+    config and the output filename.
+    """
+    on = bool(args.rand_u_start)
+    if not on:
+        return False, 0.0, 0.0
+
+    cfg = SCENARIO_PRESETS[args.scenario_level]
+    ang = args.angle_jitter_deg if args.angle_jitter_deg is not None else cfg["angle_jitter_deg"]
+    mag = args.mag_jitter_pq if args.mag_jitter_pq is not None else cfg["mag_jitter_pq"]
+    return True, float(ang), float(mag)
+
+
 def build_output_filename(args) -> str:
     mode = str(args.ybus_mode).strip()
     nr_unit = "puNR" if args.pu_nr else "siNR"
@@ -762,8 +833,28 @@ def build_output_filename(args) -> str:
         cgmes_path=str(args.cgmes_path or "").strip(),
         case_name=str(args.case_name or "").strip(),
     )
+
+    # Label solver and effective load-scale range must appear in the name:
+    # runs that differ only in these two knobs otherwise collide on the same
+    # path and silently overwrite each other under --overwrite.
+    solver_tag = "ppNR" if str(args.label_solver) == "pandapower_nr" else "cNR"
+
+    preset_range = SCENARIO_PRESETS[args.scenario_level]["load_scale_range"]
+    if preset_range is None and args.load_scale_lo is None and args.load_scale_hi is None:
+        load_tag = "lsNone"
+    else:
+        lo = args.load_scale_lo if args.load_scale_lo is not None else preset_range[0]
+        hi = args.load_scale_hi if args.load_scale_hi is not None else preset_range[1]
+        load_tag = f"ls{float(lo):.2f}-{float(hi):.2f}"
+
+    # Start-point jitter also goes in the name: a jittered and a clean run are
+    # different datasets and must not overwrite each other.
+    jit_on, jit_ang, jit_mag = resolve_start_jitter(args)
+    start_tag = f"u0jit{jit_ang:g}deg-{jit_mag:g}" if jit_on else "u0clean"
+
     name = (
         f"{case_label}_{mode}_{args.scenario_level}_{args.start_mode}_"
+        f"{solver_tag}_{load_tag}_{start_tag}_"
         f"{nr_unit}_{args.runs}_NR_branchrows_directSI.parquet"
     )
     return os.path.join(args.save_path, name)
@@ -781,6 +872,7 @@ def main():
     args = parse_args()
 
     scenario_cfg = SCENARIO_PRESETS[args.scenario_level]
+    _jit_on, _jit_ang, _jit_mag = resolve_start_jitter(args)
     source_label = _case_label_from_source(
         preset=str(args.preset or "").strip(),
         cgmes_path=str(args.cgmes_path or "").strip(),
@@ -835,9 +927,9 @@ def main():
         ),
         drop_nonconverged=bool(args.drop_nonconverged),
         pv_vset_range=scenario_cfg["pv_vset_range"],
-        rand_u_start=bool(scenario_cfg["rand_u_start"]),
-        angle_jitter_deg=float(scenario_cfg["angle_jitter_deg"]),
-        mag_jitter_pq=float(scenario_cfg["mag_jitter_pq"]),
+        rand_u_start=_jit_on,
+        angle_jitter_deg=_jit_ang,
+        mag_jitter_pq=_jit_mag,
 
         trafo_pfe_kw=args.trafo_pfe_kw,
         trafo_i0_percent=args.trafo_i0_percent,
@@ -890,6 +982,11 @@ def main():
     print(f"  scenario_cfg              = {scenario_cfg}")
     print(f"  jitter_load_q (effective) = {cfg['jitter_load_q']}")
     print(f"  load_scale_range          = {cfg['load_scale_range']}")
+    print(f"  rand_u_start (effective)  = {_jit_on}"
+          f"{'' if _jit_on else '   [clean start: jitter is opt-in via --rand_u_start]'}")
+    if _jit_on:
+        print(f"  angle_jitter_deg          = {_jit_ang}")
+        print(f"  mag_jitter_pq             = {_jit_mag}")
     print(f"  scale_gen_with_load       = {cfg['scale_gen_with_load']}")
     print(f"  line_outage_prob          = {cfg['line_outage_prob']}")
     print(f"  drop_nonconverged         = {cfg['drop_nonconverged']}")
