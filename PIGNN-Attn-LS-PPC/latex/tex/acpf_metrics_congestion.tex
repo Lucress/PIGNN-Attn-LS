@@ -1,0 +1,820 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers}{natbib}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{subcaption}
+\usepackage{colortbl}
+\usepackage[framemethod=default]{mdframed}
+
+\lstset{basicstyle=\small\ttfamily, breaklines=true, frame=single, xleftmargin=1em}
+
+\definecolor{bestgreen}{HTML}{D4EDDA}
+\definecolor{warnyellow}{HTML}{FFF3CD}
+\definecolor{badred}{HTML}{F8D7DA}
+\definecolor{neutralblue}{HTML}{CCE5FF}
+
+\title{Physical Feasibility vs.\ Prediction Accuracy:\\
+  Why PQ Residuals Are the Primary Metric\\
+  for AC Power-Flow Surrogates in Congestion Management}
+
+\author{Changhun Kim}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+  Voltage RMSE is the most common accuracy metric for GNN AC power-flow
+  surrogates, but it is a proxy.  For congestion management and optimal
+  power flow (OPF), the fundamental requirement is that the predicted
+  voltage state satisfies the nodal power-balance equations.  This note
+  formalises the distinction, establishes a metric priority order grounded
+  in how NR-family solvers define feasibility, and applies it to a set of
+  experimental runs on the LVN Heo1 grid.  The conclusion is that physical
+  residuals ($\|\Delta P\|_\infty$, $\|\Delta Q\|_\infty$, mean/p95) are
+  the primary metrics, and voltage RMSE is secondary.
+\end{abstract}
+
+%==============================================================================
+\section{The AC Power-Flow Feasibility Problem}
+%==============================================================================
+
+An AC power-flow solution is a voltage vector $(V, \theta)$ that satisfies
+the nodal power-balance equations at every constrained bus:
+
+\begin{equation}
+  \Delta P_i = P_i^{\rm set} - \mathrm{Re}\{V_i \overline{(YV)_i}\} = 0
+  \quad \forall\, i \in \text{PV} \cup \text{PQ}
+  \label{eq:dp}
+\end{equation}
+\begin{equation}
+  \Delta Q_i = Q_i^{\rm set} - \mathrm{Im}\{V_i \overline{(YV)_i}\} = 0
+  \quad \forall\, i \in \text{PQ}
+  \label{eq:dq}
+\end{equation}
+
+This is the definition used by pandapower, PYPOWER, and MATPOWER~\cite{matpower}.
+Feasibility is a set of \emph{equality constraints}, not a closeness measure.
+Newton--Raphson declares convergence when the worst-case violation falls below
+a tolerance:
+
+\begin{equation}
+  \|[\Delta P,\, \Delta Q]\|_\infty < \text{tol}
+  \label{eq:nrconv}
+\end{equation}
+
+with slack-bus $P,Q$ and PV-bus $Q$ \emph{excluded} (they are free variables).
+The default pandapower tolerance is $10^{-8}$\,MVA.
+
+A GNN surrogate predicting $(\hat{V}, \hat{\theta})$ is \emph{physically
+feasible} if and only if it satisfies \eqref{eq:dp}--\eqref{eq:dq} at the
+specified setpoints.  Voltage RMSE does not test this.
+
+%==============================================================================
+\section{Why Voltage RMSE Is Insufficient for Congestion Management}
+%==============================================================================
+
+Congestion management and OPF require a predicted state from which
+operationally meaningful quantities can be derived:
+
+\begin{itemize}[noitemsep]
+  \item Branch complex power flows $S_{ij} = V_i I_{ij}^*$
+  \item Line current magnitudes $|I_{ij}|$ and thermal loading
+  \item Voltage constraint violations ($V_{\min} \le |V_i| \le V_{\max}$)
+  \item Feasibility margins and available transfer capacity
+\end{itemize}
+
+All of these are \textbf{functions of the voltage state}.  If the predicted
+state does not satisfy the AC power-balance equations, these derived
+quantities are unreliable even when voltage RMSE looks small.
+
+The reason is nonlinearity and network stiffness.  In a multi-voltage LVN
+grid, diagonal admittance entries can reach $|Y_{ii}| \sim 10^6$\,p.u.
+A small voltage error $\epsilon$ at such a bus produces a mismatch:
+
+\begin{equation}
+  |\Delta S_i| \approx |Y_{ii}| \cdot |\epsilon| \sim 10^6 \cdot \epsilon
+  \label{eq:stiff}
+\end{equation}
+
+So $\epsilon = 10^{-3}$\,p.u.\ in voltage can yield $|\Delta S_i| \sim
+10^3$\,p.u.\ in power mismatch.  Voltage RMSE $= 10^{-3}$\,p.u.\ can
+coexist with $\|\Delta P\|_\infty = 10^3$\,p.u. --- three orders of
+magnitude apart.
+
+This is directly confirmed by the LVN experiments: mean $|\Delta P|
+\sim 4 \times 10^{-4}$\,p.u.\ for individual buses while
+$\|\Delta P\|_\infty \sim 10^5$\,p.u.\ at the stiffest bus.
+
+%==============================================================================
+\section{Metric Priority Order}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\caption{Metric priority order for GNN AC-PF surrogates used in congestion
+  management and OPF.  All mismatch quantities use the masked convention:
+  slack excluded from $\Delta P$; slack + PV excluded from $\Delta Q$.}
+\label{tab:priority}
+\begin{tabular}{clp{8cm}}
+\toprule
+Priority & Metric & Rationale \\
+\midrule
+1 & $\|\Delta P\|_\infty$, $\|\Delta Q\|_\infty$ &
+  Worst-case power-balance violation.  A single bus with large residual
+  means the state is not AC-feasible.  This is the direct analogue of
+  NR convergence criterion \eqref{eq:nrconv}. \\[4pt]
+2 & mean / p95 $|\Delta P|$, $|\Delta Q|$ &
+  Distribution of residuals across buses.  Mean shows typical quality;
+  p95 shows near-worst quality without being dominated by one outlier.
+  Together with Priority 1, they reveal whether the problem is
+  localised or widespread. \\[4pt]
+3 & Branch-flow / loading error &
+  Direct congestion-management target.  Line flows $S_{ij}$ and
+  transformer loadings are computed from the predicted state; errors
+  here translate directly to wrong congestion decisions. \\[4pt]
+4 & $|V|$ RMSE, $\theta$ RMSE &
+  Closeness to the NR reference voltage.  Necessary but not sufficient.
+  A prediction can be close in MSE but physically inconsistent
+  (see Section~\ref{sec:quadrant}). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Why $\|\cdot\|_\infty$ before mean.}
+AC-PF feasibility is an \emph{all-bus} requirement: every constrained bus
+must satisfy \eqref{eq:dp}--\eqref{eq:dq}.  One bus with a large violation
+is sufficient to declare the state infeasible, regardless of how well all
+other buses behave.  Mean/p95 then answers whether the failure is isolated
+or systemic.
+
+\paragraph{Literature grounding.}
+\begin{itemize}[noitemsep]
+  \item MATPOWER defines AC power flow as solving the mismatch equations
+    $g(x)=0$ for bus voltage variables~\cite{matpower}.  The residual being
+    small is the definition of a solution, not an optional diagnostic.
+  \item OPF formulations enforce nodal power balance alongside line-flow
+    and voltage limits~\cite{opfreview}.  Physical feasibility is a hard
+    constraint, not a soft metric.
+  \item Approximate OPF solutions often violate AC equations and require
+    explicit feasibility restoration~\cite{feasrestore}.  This motivates
+    reporting power-balance residuals separately from voltage accuracy.
+  \item Physics-informed neural AC-OPF papers report worst-case constraint
+    violations as primary metrics~\cite{pinnopf}, directly supporting
+    Priority 1.
+\end{itemize}
+
+%==============================================================================
+\section{The Four-Quadrant Classification}
+\label{sec:quadrant}
+%==============================================================================
+
+Every predicted voltage state falls into one of four quadrants defined by
+accuracy (voltage RMSE vs.\ NR reference) and feasibility (PQ residual):
+
+\begin{table}[h]
+\centering
+\caption{Four-quadrant classification of predicted voltage states.}
+\label{tab:quadrant}
+\begin{tabular}{p{3.5cm} p{4.5cm} p{4.5cm}}
+\toprule
+ & \textbf{Low PQ residual} (feasible) & \textbf{High PQ residual} (infeasible) \\
+\midrule
+\textbf{Close to NR} (accurate) &
+  \cellcolor{bestgreen}
+  \textbf{Best.} Prediction matches NR and satisfies AC equations.
+  Line flows and constraint margins are trustworthy. &
+  \cellcolor{warnyellow}
+  \textbf{Risky.} Numerically close-looking, but power-balance violated.
+  Derived line flows unreliable, especially on stiff buses. \\[8pt]
+\textbf{Far from NR} (inaccurate) &
+  \cellcolor{neutralblue}
+  \textbf{Physically feasible, operationally uncertain.}
+  Satisfies AC equations but may correspond to a different operating point.
+  Usable if it is the correct load scenario. &
+  \cellcolor{badred}
+  \textbf{Worst.} Neither accurate nor physically feasible. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The subtle case: Close + High residual.}
+This happens in stiff multi-voltage grids where small voltage errors produce
+large power mismatches via \eqref{eq:stiff}.  The voltage vector looks
+acceptable in RMSE, but no NR solver would accept it as converged.
+Congestion conclusions drawn from such a state can be wrong because the
+inferred branch flows do not correspond to any valid operating point.
+
+\paragraph{For congestion management, the ranking is:}
+\begin{enumerate}[noitemsep]
+  \item Close to NR + Low residual --- best.
+  \item Far from NR + Low residual --- physically feasible; verify operating point.
+  \item Close to NR + High residual --- numerically plausible, physically wrong.
+  \item Far from NR + High residual --- worst.
+\end{enumerate}
+
+%==============================================================================
+\section{Experimental Results}
+%==============================================================================
+
+\subsection{Do Not Mix Perturbation Regimes}
+
+The LVN logs contain two different data regimes.  They must be reported
+separately: the old low-residual Claude run in
+\texttt{lvn\_case300\_configs\_share\_grid\_20260531\_141537} used
+\textbf{Perturbation A}, while the later LVN experiments use
+\textbf{snapshot-envelope} parquets.  The residual scale is therefore not a
+pure model effect; it also reflects the sampled operating distribution.
+
+\begin{table}[h]
+\centering
+\caption{LVN Heo1 log groups and data regimes.  The Perturbation A rows are
+  retained as useful historical evidence, but are not directly comparable to
+  snapshot-envelope rows.}
+\label{tab:regimes}
+\setlength{\tabcolsep}{4pt}
+\small
+\begin{tabular}{p{3.1cm}p{2.9cm}p{4.9cm}p{3.8cm}}
+\toprule
+Log group & Regime & Parquet evidence & Comparable with \\
+\midrule
+\texttt{20260531\_141537}
+  & Perturbation A, DC start
+  & \texttt{LVN\_ppcY\_A\_dc\_compile\_\ldots.parquet}
+  & Perturbation A only \\
+\texttt{20260531\_141541}
+  & Snapshot-envelope, manual flat
+  & \texttt{LVN\_snapshot\_envelope\_manual\_flat\_\ldots.parquet}
+  & Snapshot-envelope flat-start runs \\
+Current 24-job ablation
+  & Snapshot-envelope, DC and flat
+  & DC and manual-flat snapshot-envelope parquets; residuals evaluated in
+    \texttt{complex128}
+  & Snapshot-envelope runs only \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Snapshot-Envelope Results}
+
+Table~\ref{tab:results} reports snapshot-envelope results only.  This is the
+right table for judging the current LVN snapshot-envelope experiments.
+
+\begin{table}[h]
+\centering
+\caption{LVN Heo1 snapshot-envelope comparison.  All metrics are validation
+  values unless noted otherwise.
+  $\Delta P^\infty$, $\Delta Q^\infty$, mean, and p95 are in p.u.\
+  (masked: slack excluded from $\Delta P$; slack+PV excluded from $\Delta Q$).
+  Baseline rows (grey) are computed directly from the dataset parquet using
+  \texttt{complex128} and the same per-unit conversion as training
+  ($S_{\rm base}=10^8$\,VA).
+  ``---'' means not logged.}
+\label{tab:results}
+\setlength{\tabcolsep}{3.5pt}
+\small
+\begin{tabular}{p{3.0cm}rrrrrrrp{2.0cm}}
+\toprule
+Run & $|V|$ RMSE & $\theta$ & $\Delta P^\infty$ & $\Delta Q^\infty$
+    & $\overline{|\Delta P|}$ & $\overline{|\Delta Q|}$
+    & p95 $|\Delta P|$ & Notes \\
+\midrule
+%--- reference baselines ---
+\rowcolor{gray!15}
+\multicolumn{9}{l}{\textit{Reference baselines (snapshot-envelope, complex128, 36k cases)}} \\
+\rowcolor{gray!15}
+DC init ($u_{\rm start}$)
+  & 4.03e-2 & 0.337\ensuremath{^\circ} & 6.28e2 & 5.01e3 & 2.810 & 11.81 & ---
+  & Start of DC-init dataset \\
+\rowcolor{gray!15}
+NR solution ($u_{\rm newton}$, DC)
+  & \textit{0} & \textit{0\ensuremath{^\circ}} & \textit{9.54e-10} & \textit{3.60e-9}
+  & \textit{2.46e-12} & \textit{1.04e-11} & ---
+  & \textit{Converged reference} \\
+\rowcolor{gray!15}
+Flat start ($u_{\rm start}$)
+  & 4.03e-2 & 3.440\ensuremath{^\circ} & 6.32e2 & 5.01e3 & 2.814 & 11.81 & ---
+  & Start of flat dataset \\
+\rowcolor{gray!15}
+NR solution ($u_{\rm newton}$, flat)
+  & \textit{0} & \textit{0\ensuremath{^\circ}} & \textit{9.99e-10} & \textit{3.18e-9}
+  & \textit{2.48e-12} & \textit{1.03e-11} & ---
+  & \textit{Converged reference} \\
+\midrule
+%--- model runs ---
+\multicolumn{9}{l}{\textit{Old Claude snapshot-envelope manual-flat runs (20260531\_141541)}} \\[2pt]
+\rowcolor{neutralblue}
+Claude snapshot flat
+  \newline\quad K40 dhi16 attn8
+  & 7.56e-2 & 3.697\ensuremath{^\circ} & 171.3 & 518.3
+  & 1.686 & 1.594 & 2.644
+  & Snapshot flat \\[3pt]
+\rowcolor{neutralblue}
+Claude snapshot flat
+  \newline\quad K40 dhi16 attn10
+  & 7.55e-2 & 3.691\ensuremath{^\circ} & 169.3 & 518.3
+  & 1.691 & 1.580 & 3.052
+  & Snapshot flat \\[3pt]
+\multicolumn{9}{l}{\textit{Restored old-fixed Armijo, PINN-only A100 reruns (20260614, batch 16)}} \\[2pt]
+\rowcolor{bestgreen}
+Restored old-fixed
+  \newline\quad flat K40 dhi16 attn8
+  & 4.02e-2 & 3.879\ensuremath{^\circ} & 169.4 & 518.3
+  & 1.686 & 1.595 & 2.947
+  & PINN only, no \texttt{vn\_feat} \\[3pt]
+\rowcolor{neutralblue}
+Restored old-fixed
+  \newline\quad flat K40 dhi16 attn10
+  & 3.95e-2 & 3.480\ensuremath{^\circ} & 459.1 & 3725
+  & 3.510 & 9.760 & 6.660
+  & PINN only, no \texttt{vn\_feat} \\[3pt]
+\rowcolor{bestgreen}
+Restored old-fixed
+  \newline\quad flat K40 dhi16 attn10 + \texttt{vn}
+  & 3.95e-2 & 3.438\ensuremath{^\circ} & \textbf{41.2} & 519.7
+  & \textbf{0.353} & \textbf{1.493} & \textbf{0.903}
+  & Best restored flat residual \\[3pt]
+\rowcolor{bestgreen}
+Restored old-fixed
+  \newline\quad DC K40 dhi16 attn8
+  & 3.99e-2 & 1.592\ensuremath{^\circ} & 167.3 & 518.2
+  & 1.639 & 1.582 & 3.040
+  & PINN only, no \texttt{vn\_feat} \\[3pt]
+\rowcolor{neutralblue}
+Restored old-fixed
+  \newline\quad DC K40 dhi16 attn10
+  & 4.00e-2 & 1.715\ensuremath{^\circ} & 211.4 & 518.4
+  & 1.709 & 2.245 & 3.868
+  & PINN only, no \texttt{vn\_feat} \\[3pt]
+\rowcolor{neutralblue}
+Restored old-fixed
+  \newline\quad DC K40 dhi16 attn10 + \texttt{vn}
+  & 3.92e-2 & 1.225\ensuremath{^\circ} & 303.4 & 513.9
+  & 3.133 & 2.012 & 6.491
+  & Lowest restored DC angle \\[3pt]
+\midrule
+\multicolumn{9}{l}{\textit{Current snapshot-envelope 24-job ablation (complex128 residuals; last validation epoch)}} \\[2pt]
+\rowcolor{bestgreen}
+moregeom/reject \texttt{dc\_pinn\_mse}
+  & \textbf{2.02e-2} & \textbf{0.154\ensuremath{^\circ}} & 902.7 & 1733
+  & 11.60 & 27.90 & 38.75
+  & Best $|V|,\theta$ current \\[3pt]
+\rowcolor{neutralblue}
+moregeom/reject \texttt{dc\_pinn\_only}
+  & 4.73e-2 & 1.548\ensuremath{^\circ} & 705.8 & 801.9
+  & 9.957 & 11.59 & 16.36
+  & Best max residual current \\[3pt]
+moregeom/reject \texttt{flat\_pinn\_only}
+  & 7.28e-2 & 3.502\ensuremath{^\circ} & 1842 & 3841
+  & 16.71 & 26.97 & 12.49
+  & Best current flat max residual \\[3pt]
+\rowcolor{warnyellow}
+Student pure MSE
+  \newline\quad 260601-5c0d
+  & \textbf{2.18e-2} & 0.750\ensuremath{^\circ} & --- & ---
+  & --- & --- & ---
+  & Best $|V|$; no res.\ logged \\[3pt]
+\rowcolor{warnyellow}
+Student PINN/mixed
+  \newline\quad 260601-8258
+  & 2.43e-2 & 2.032\ensuremath{^\circ} & --- & ---
+  & --- & --- & ---
+  & No res.\ logged \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Perturbation A Results}
+
+Table~\ref{tab:pertA} preserves the old Claude low-residual results, but
+labels them as Perturbation A.  These runs used
+\texttt{LVN\_ppcY\_A\_dc\_compile\_siNR\_36000\_NR\_branchrows\_directSI.parquet}
+from log group \texttt{20260531\_141537}.  They should be used as evidence
+that the architecture can obtain low residuals on an easier/narrower
+operating distribution, not as a snapshot-envelope benchmark.
+
+\begin{table}[h]
+\centering
+\caption{Old Claude Perturbation A validation results
+  (\texttt{20260531\_141537}).  All residuals are in p.u.}
+\label{tab:pertA}
+\setlength{\tabcolsep}{4pt}
+\small
+\begin{tabular}{p{3.2cm}rrrrrrp{3.0cm}}
+\toprule
+Run & $|V|$ RMSE & $\theta$ & $\Delta P^\infty$ & $\Delta Q^\infty$
+    & $\overline{|\Delta P|}$ & $\overline{|\Delta Q|}$ & Notes \\
+\midrule
+\rowcolor{bestgreen}
+Perturb A DC K40 dhi16 attn8
+  & 4.504e-2 & 0.229\ensuremath{^\circ} & \textbf{16.65} & 88.58
+  & \textbf{0.192} & 0.552
+  & Historical low-residual run \\
+Perturb A DC K40 dhi16 attn10
+  & 4.505e-2 & 0.236\ensuremath{^\circ} & 29.23 & \textbf{70.22}
+  & 0.208 & \textbf{0.513}
+  & Historical low-residual run \\
+Perturb A DC K40 dhi24 attn8
+  & 4.484e-2 & 0.239\ensuremath{^\circ} & 17.22 & 73.20
+  & 0.226 & 0.561
+  & Historical low-residual run \\
+Perturb A DC K40 dhi24 attn10
+  & 4.507e-2 & 0.256\ensuremath{^\circ} & 41.44 & 74.43
+  & 0.304 & 0.608
+  & Historical low-residual run \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reading the Table}
+
+\paragraph{Reference baselines.}
+The grey rows are computed directly from the LVN snapshot-envelope parquets
+using \texttt{complex128}, the same per-unit conversion as training
+($S_{\rm base}=10^8$\,VA, \texttt{share\_grid=True}), and the same masked
+residual convention.  They establish three reference levels:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{NR solution} ($u_{\rm newton}$): the ground-truth converged
+    state. In \texttt{complex128}, $\|\Delta P\|_\infty$ and
+    $\|\Delta Q\|_\infty$ are approximately $10^{-9}$\,p.u.  This is the
+    target any surrogate should aim for.
+  \item \textbf{DC init} ($u_{\rm start}$): the starting point for DC-init
+    runs. $\|\Delta P\|_\infty = 628$\,p.u.,
+    $\|\Delta Q\|_\infty = 5013$\,p.u.  A model must reduce these
+    significantly to be useful.
+  \item \textbf{Flat start} ($u_{\rm start}$): the starting point for flat
+    runs. $\|\Delta P\|_\infty = 632$\,p.u., $\|\Delta Q\|_\infty = 5013$\,p.u.
+    The residual is similar to DC init, but the angle is much worse
+    ($3.440^\circ$ vs.\ $0.337^\circ$).
+\end{itemize}
+
+\paragraph{Old Claude snapshot-envelope flat runs.}
+The old snapshot-envelope flat-start runs in \texttt{20260531\_141541}
+achieve $\|\Delta P\|_\infty \approx 170$\,p.u.\ and
+$\|\Delta Q\|_\infty \approx 518$\,p.u.  These are the strongest
+snapshot-envelope feasibility numbers currently found in the old logs, but
+they are manual-flat snapshot-envelope runs, not Perturbation A and not
+DC-start snapshot-envelope.
+
+\paragraph{Current 24-job ablation.}
+Among the current complex128-evaluated jobs,
+\texttt{moregeom/reject + dc\_pinn\_mse} gives the best voltage/angle
+accuracy, while \texttt{moregeom/reject + dc\_pinn\_only} gives the best
+maximum residual.  Both are snapshot-envelope results, but neither reaches
+the lower residual level of the old snapshot-envelope flat run.
+
+\paragraph{Perturbation A low-residual result.}
+The old Claude Perturbation A run with K40, dhi16, attn8 achieves
+$\|\Delta P\|_\infty = 16.65$\,p.u.  This is the lowest residual found in
+the historical logs, but it belongs to a different data regime.  It should
+not be cited as the best snapshot-envelope result.
+
+\paragraph{Student pure MSE --- best supervised accuracy, unknown feasibility.}
+The student MSE run achieves the best $|V|$ RMSE ($2.18 \times 10^{-2}$)
+and a competitive $\theta$ RMSE ($0.75^\circ$), but power-balance residuals
+were not logged.  For congestion management this is a risk: the model may be
+close to the NR reference in MSE while violating AC equations (the ``Close
++ High residual'' quadrant).  Residual evaluation on saved checkpoints is
+required before this run can be recommended for operational use.
+
+\subsection{Run Ranking for Congestion Management}
+
+\paragraph{Snapshot-envelope ranking.}
+\begin{enumerate}
+  \item \textbf{Old Claude snapshot-envelope flat K40 dhi16 attn8/10}:
+    lowest snapshot-envelope residuals found in the logs
+    ($\Delta P^\infty \approx 170$, $\Delta Q^\infty \approx 518$).
+  \item \textbf{moregeom/reject + dc\_pinn\_only}: best max residual among
+    current complex128-evaluated jobs.
+  \item \textbf{moregeom/reject + dc\_pinn\_mse}: best voltage/angle accuracy
+    among current complex128-evaluated jobs.
+  \item \textbf{Student pure MSE}: best supervised accuracy, but feasibility
+    unknown until residuals are evaluated.
+\end{enumerate}
+
+\paragraph{Perturbation A ranking.}
+Within Perturbation A only, the old Claude K40 dhi16 attn8 run is the best
+low-residual reference.  It is valuable as a proof that the model family can
+learn a physically consistent correction, but it should not be mixed with
+snapshot-envelope conclusions.
+
+%==============================================================================
+\section{Recommended Reporting Table}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\caption{Recommended metric set for every GNN AC-PF surrogate evaluation.
+  Masking: slack excluded from $\Delta P$; slack + PV excluded from
+  $\Delta Q$.}
+\label{tab:reporting}
+\begin{tabular}{lllc}
+\toprule
+Metric & Unit & Statistics & Priority \\
+\midrule
+$|\Delta P|$ (PV+PQ masked) & p.u. / MW   & max, p95, mean & \textbf{1} \\
+$|\Delta Q|$ (PQ masked)    & p.u. / MVAr & max, p95, mean & \textbf{1} \\
+Convergence rate
+  & \% buses $< 10^{-3}$\,p.u. & --- & 2 \\
+Branch-flow error
+  & p.u. / MVA & MAE, max & 3 \\
+$|V|$ error & p.u. & MAE, max & 4 \\
+$\theta$ error & deg & MAE, max & 4 \\
+NR polish steps & count & mean over test set & (optional) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{NR polish step count (optional).}
+Starting from the surrogate prediction, run pandapower to convergence and
+count NR iterations.  Compare against a flat start ($|V|=1$, $\theta=0$).
+This is a practical bridge metric: a surrogate that halves NR iterations is
+concretely useful even if its raw residual is not at solver tolerance.
+
+\paragraph{Always report both max and mean/p95.}
+$\|\cdot\|_\infty$ is the feasibility alarm: one bad bus fails the whole
+state.  Mean and p95 characterise the distribution: is the failure
+localised or widespread?  Both are needed.  Reporting only mean can mask
+a single catastrophically bad bus; reporting only max can be dominated by
+one edge-case outlier.
+
+%==============================================================================
+%==============================================================================
+\section{Numerical Precision: Why Residual Evaluation Requires
+  \texttt{complex128} on LVN}
+%==============================================================================
+
+\subsection{The Catastrophic Cancellation Problem}
+
+The AC power-flow residual is defined as:
+
+\begin{equation}
+  \Delta S_i = S_i^{\rm set} - V_i \cdot \overline{(YV)_i}
+  \label{eq:residual}
+\end{equation}
+
+At a converged NR solution the two terms in \eqref{eq:residual} are
+nearly equal, so $\Delta S_i \approx 0$.  Computing a tiny difference
+between two large, nearly equal numbers is the classical
+\emph{catastrophic cancellation} scenario in floating-point arithmetic.
+
+The severity of the cancellation depends on the scale of the intermediate
+quantities.  In LVN, admittance entries reach $|Y_{ij}| \sim 10^6$\,p.u.\
+(see Section~\ref{sec:stiff}).  The matrix-vector product $YV$ therefore
+involves values of order $10^6$, and the true residual is of order $10^{-9}$
+--- a ratio of $10^{15}$.
+
+\paragraph{\texttt{complex64} precision budget.}
+\texttt{complex64} (IEEE 754 single-precision) stores approximately
+$7$ significant decimal digits.  For a quantity of magnitude $10^6$,
+the representable resolution is:
+
+\begin{equation}
+  \delta_{\rm float32} \approx 10^6 \times 10^{-7} = 0.1
+\end{equation}
+
+Rounding errors of order $0.1$\,p.u.\ accumulate in the matrix-vector
+product, completely swamping a true residual of $10^{-9}$\,p.u.
+
+\paragraph{\texttt{complex128} precision budget.}
+\texttt{complex128} (IEEE 754 double-precision) stores approximately
+$15$--$16$ significant decimal digits.  For the same $10^6$-scale
+quantities:
+
+\begin{equation}
+  \delta_{\rm float64} \approx 10^6 \times 10^{-16} = 10^{-10}
+\end{equation}
+
+This is sufficient to resolve residuals of order $10^{-9}$\,p.u., which
+is the true NR convergence level.
+
+\paragraph{Simple analogy.}
+Suppose the true injected and received powers at a bus are:
+\begin{align*}
+  S^{\rm set} &= 1\,000\,000.123\,456\;\text{p.u.}\\
+  V \cdot \overline{(YV)} &= 1\,000\,000.123\,455\;\text{p.u.}\\
+  \text{True residual} &= 0.000\,001\;\text{p.u.}
+\end{align*}
+In \texttt{float32}, both values round to $1\,000\,000$ and the residual
+becomes $0$ (or $\sim 0.1$ from inconsistent rounding).  In
+\texttt{float64}, both are stored to 15 digits and the difference is
+recovered correctly.
+
+\subsection{Observed Effect on LVN Baseline Residuals}
+
+Table~\ref{tab:c128} shows the baseline state residuals computed in
+\texttt{complex128} from the LVN snapshot-envelope parquets, using the
+same per-unit convention as training ($S_{\rm base}=10^8$\,VA).
+
+\begin{table}[h]
+\centering
+\caption{LVN Heo1 residuals: \texttt{complex128} baselines (top) and
+  24-job ablation runs (bottom, last validation epoch before
+  timeout/failure).  Groups: \texttt{default}/\texttt{moregeom}
+  $\times$ \texttt{geometric\_safe}/\texttt{reject}.
+  All residuals in p.u.\ (masked convention;
+  $S_{\rm base}=10^8$\,VA).}
+\label{tab:c128}
+\setlength{\tabcolsep}{2.5pt}
+\footnotesize
+\begin{tabular}{llrrrrrrrr}
+\toprule
+Group / State & Case & ep
+  & $|V|$ RMSE & $\theta$
+  & $\Delta P^\infty$ & $\Delta Q^\infty$
+  & $\overline{|\Delta P|}$ & $\overline{|\Delta Q|}$
+  & p95 $|\Delta P|$ \\
+\midrule
+\multicolumn{10}{l}{\textit{Reference baselines (complex128, 36k cases)}} \\
+DC init ($u_{\rm start}$)       & --- & --- & 4.03e-2 & 0.337\ensuremath{^\circ} & 6.28e2 & 5.01e3 & 2.810 & 11.81 & --- \\
+\rowcolor{bestgreen}
+NR solution (DC)                & --- & --- & \textit{0} & \textit{0\ensuremath{^\circ}} & \textit{9.54e-10} & \textit{3.60e-9} & \textit{2.46e-12} & \textit{1.04e-11} & --- \\
+Flat start ($u_{\rm start}$)    & --- & --- & 4.03e-2 & 3.440\ensuremath{^\circ} & 6.32e2 & 5.01e3 & 2.814 & 11.81 & --- \\
+\rowcolor{bestgreen}
+NR solution (flat)              & --- & --- & \textit{0} & \textit{0\ensuremath{^\circ}} & \textit{9.99e-10} & \textit{3.18e-9} & \textit{2.48e-12} & \textit{1.03e-11} & --- \\
+\midrule
+\multicolumn{10}{l}{\textit{default / geometric\_safe}} \\
+& dc\_pinn\_only  & 10 & 4.717e-2 & 1.014\ensuremath{^\circ} & 2.806e5 & 1.568e5 & 2.782e3 & 1.266e3 & 1.921e3 \\
+& dc\_mse\_only   & 10 & 3.248e-2 & 0.528\ensuremath{^\circ} & 1.585e5 & 9.241e4 & 1.309e3 & 7.105e2 & 3.853e2 \\
+& dc\_pinn\_mse   & 12 & 4.611e-2 & 0.937\ensuremath{^\circ} & 2.696e5 & 1.422e5 & 2.555e3 & 1.072e3 & 1.710e3 \\
+& flat\_pinn\_only& 12 & 7.961e-2 & 3.773\ensuremath{^\circ} & 2.176e5 & 1.037e5 & 2.435e3 & 1.050e3 & 2.123e3 \\
+& flat\_mse\_only & 10 & 3.764e-2 & 1.270\ensuremath{^\circ} & 1.084e5 & 3.095e4 & 7.332e2 & 3.111e2 & 8.271e1 \\
+& flat\_pinn\_mse & 12 & 7.908e-2 & 3.741\ensuremath{^\circ} & 2.129e5 & 5.163e4 & 1.837e3 & 4.442e2 & 1.473e3 \\
+\midrule
+\multicolumn{10}{l}{\textit{moregeom / geometric\_safe}} \\
+& dc\_pinn\_only  & 11 & 4.145e-2 & 0.553\ensuremath{^\circ} & 3.155e3 & 3.695e3 & 32.47 & 29.21 & 8.984 \\
+& dc\_mse\_only   & 10 & 3.672e-2 & 0.184\ensuremath{^\circ} & 3.515e3 & 4.727e3 & 18.79 & 17.46 & 2.957 \\
+& dc\_pinn\_mse   & 11 & 4.053e-2 & 0.339\ensuremath{^\circ} & 3.903e3 & 4.620e3 & 33.10 & 25.57 & 1.939 \\
+& flat\_pinn\_only& 12 & 7.133e-2 & 3.395\ensuremath{^\circ} & 3.685e3 & 4.254e3 & 41.22 & 21.51 & 21.86 \\
+& flat\_mse\_only & 10 & 6.030e-2 & 2.737\ensuremath{^\circ} & 6.500e3 & 4.862e3 & 42.17 & 32.51 & 5.650 \\
+& flat\_pinn\_mse & 13 & 7.187e-2 & 3.422\ensuremath{^\circ} & 2.860e3 & 4.305e3 & 32.66 & 19.29 & 2.070 \\
+\midrule
+\multicolumn{10}{l}{\textit{default / reject}} \\
+& dc\_pinn\_only  & 30 & 4.121e-2 & 0.522\ensuremath{^\circ} & 4.280e3 & 4.154e3 & 17.39 & 29.63 & 4.070 \\
+& dc\_mse\_only   & 30 & 4.071e-2 & 0.333\ensuremath{^\circ} & 6.283e2 & 5.013e3 & 2.810 & 11.81 & 5.960e-2 \\
+& dc\_pinn\_mse   &  1 & 4.155e-2 & 0.610\ensuremath{^\circ} & 4.642e3 & 4.774e3 & 35.60 & 29.21 & 8.229 \\
+& flat\_pinn\_only& 30 & 7.190e-2 & 3.414\ensuremath{^\circ} & 4.955e3 & 4.071e3 & 19.97 & 32.16 & 4.607 \\
+& flat\_mse\_only & 30 & 7.229e-2 & 3.438\ensuremath{^\circ} & 6.315e2 & 5.013e3 & 2.814 & 11.81 & 1.586e-1 \\
+& flat\_pinn\_mse &  1 & 7.157e-2 & 3.395\ensuremath{^\circ} & 4.899e3 & 4.701e3 & 15.10 & 15.86 & 1.988 \\
+\midrule
+\multicolumn{10}{l}{\textit{moregeom / reject}} \\
+\rowcolor{bestgreen}
+& dc\_pinn\_mse   & 14 & \textbf{2.020e-2} & \textbf{0.154\ensuremath{^\circ}} & 9.027e2 & 1.733e3 & 11.60 & 27.90 & 38.75 \\
+\rowcolor{neutralblue}
+& dc\_pinn\_only  & 29 & 4.731e-2 & 1.548\ensuremath{^\circ} & \textbf{7.058e2} & \textbf{8.019e2} & 9.957 & 11.59 & 16.36 \\
+& dc\_mse\_only   & 15 & 3.958e-2 & 0.199\ensuremath{^\circ} & 3.286e3 & 4.938e3 & 28.22 & 20.47 & 0.987 \\
+& flat\_pinn\_only& 29 & 7.281e-2 & 3.502\ensuremath{^\circ} & 1.842e3 & 3.841e3 & 16.71 & 26.97 & 12.49 \\
+& flat\_mse\_only & 11 & 6.064e-2 & 2.728\ensuremath{^\circ} & 3.286e3 & 4.795e3 & 7.124 & 11.92 & 0.326 \\
+& flat\_pinn\_mse & 12 & 3.558e-2 & 1.110\ensuremath{^\circ} & 2.962e3 & 1.920e3 & 33.68 & 22.36 & 35.39 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Key Observations}
+
+\paragraph{NR residuals are at machine precision.}
+The NR solution residuals ($\Delta P^\infty \approx 10^{-9}$\,p.u.,
+mean $|\Delta P| \approx 10^{-12}$\,p.u.) confirm that $u_{\rm newton}$
+is genuinely converged.  These numbers are only recoverable in
+\texttt{complex128}; in \texttt{complex64} they would appear as $\sim0.1$
+due to cancellation error --- an artefact, not physics.
+
+\paragraph{DC init vs.\ flat start: angle matters, residual does not.}
+DC initialisation gives a far better angle estimate ($0.337^\circ$ vs.\
+$3.440^\circ$), but the AC residuals are almost identical:
+\begin{align*}
+  \text{DC init:}   &\quad \text{mean}\,|\Delta P| = 2.810,\quad \|\Delta Q\|_\infty = 5013 \\
+  \text{Flat start:}&\quad \text{mean}\,|\Delta P| = 2.814,\quad \|\Delta Q\|_\infty = 5013
+\end{align*}
+DC initialisation improves the voltage/angle starting point but does not
+make the state AC-feasible.  Both starts are equally far from satisfying
+\eqref{eq:residual}; the model must do the real work of reducing residuals.
+
+\paragraph{Practical implication for model evaluation.}
+The previous evaluation used \texttt{complex64}, which yielded
+NR-solution residuals of $\sim 10^{-1}$\,p.u.\ --- many orders of
+magnitude above truth.  The current snapshot-envelope ablation table uses
+\texttt{complex128} residual evaluation.  Older historical log entries are
+kept with their original logged metrics and are therefore best used for
+within-regime comparison, not as exact numerical baselines against the
+\texttt{complex128} 24-job ablation.
+
+\subsection{Recommended Precision Policy}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Training}: \texttt{complex64} is acceptable.  The physics
+    loss is a sum of squared residuals optimised by gradient descent;
+    absolute residual magnitude matters less than its gradient direction.
+  \item \textbf{Residual evaluation on LVN}: always use \texttt{complex128}.
+    The true NR residual is $\sim10^{-9}$\,p.u.; \texttt{complex64} cannot
+    resolve below $\sim10^{-1}$\,p.u.\ on this grid.
+  \item \textbf{HV/MV grids}: \texttt{complex64} is sufficient.
+    Admittances are smaller ($|Y_{ij}| \ll 10^6$), so cancellation is
+    less severe and the NR residual ($\sim10^{-8}$\,p.u.) is above the
+    \texttt{float32} noise floor.
+\end{itemize}
+
+\subsection{24-Job Ablation: Key Observations}
+
+None of the 24 jobs reached final test evaluation (all ended in TIMEOUT or
+FAILED); metrics above are from the last validation epoch before termination.
+
+\paragraph{Best overall balance --- \texttt{moregeom/reject + dc\_pinn\_mse} (green).}
+Lowest Val RMSE ($2.020 \times 10^{-2}$) and best angle error ($0.154^\circ$)
+across all 24 jobs.  $\|\Delta P\|_\infty = 9.027 \times 10^2$\,p.u.\ and
+$\|\Delta Q\|_\infty = 1.733 \times 10^3$\,p.u.\ are roughly $100\times$
+below the \texttt{default/geometric\_safe} runs.
+
+\paragraph{Best max residual --- \texttt{moregeom/reject + dc\_pinn\_only} (blue).}
+Lowest worst-case residuals ($\|\Delta P\|_\infty = 7.058 \times 10^2$,
+$\|\Delta Q\|_\infty = 8.019 \times 10^2$), but angle accuracy is worse
+($1.548^\circ$ vs.\ $0.154^\circ$).  Preferred when a single-bus outlier
+is the dominant concern; \texttt{dc\_pinn\_mse} is better for general accuracy.
+
+\paragraph{\texttt{default/reject} MSE-only cases --- frozen at start.}
+\texttt{dc\_mse\_only} and \texttt{flat\_mse\_only} in \texttt{default/reject}
+show $\|\Delta P\|_\infty \approx 6.3 \times 10^2$ and mean $|\Delta P|
+\approx 2.81$, matching the flat-start initialisation residual (baselines
+above).  These runs did not reduce AC residuals despite 30 epochs, indicating
+training collapse or dataset mismatch --- a pattern absent in
+\texttt{moregeom/reject}, suggesting \texttt{moregeom} perturbation diversity
+is critical for the MSE-only variant.
+
+%==============================================================================
+\section{Summary}
+%==============================================================================
+
+\begin{itemize}[noitemsep]
+  \item AC-PF feasibility is defined by power-balance equality constraints
+    \eqref{eq:dp}--\eqref{eq:dq}, not by closeness to a reference voltage.
+  \item In stiff multi-voltage grids, small voltage errors can produce large
+    power mismatches via $|\Delta S| \approx |Y_{ii}| \cdot \epsilon$.
+  \item For congestion management, PQ residuals ($\|\Delta P\|_\infty$,
+    $\|\Delta Q\|_\infty$, mean, p95) are the primary metrics; voltage
+    RMSE is secondary.
+  \item Among \textbf{snapshot-envelope} runs, the old Claude manual-flat
+    K40 dhi16 attn8/10 logs have the lowest historical residuals found so
+    far; among the current complex128 24-job ablation, \texttt{moregeom/reject}
+    is the strongest family.
+  \item The very low-residual old Claude K40 dhi16 attn8 result belongs to
+    \textbf{Perturbation A}.  It is useful historical evidence, but must not
+    be mixed with snapshot-envelope conclusions.
+  \item The student MSE run has the best supervised accuracy but lacks
+    residual evaluation; it should not be used for operational purposes
+    without residual verification.
+  \item The recommended evaluation table (Table~\ref{tab:reporting}) reports
+    residuals first, convergence rate second, branch flows third, and
+    voltage/angle RMSE last.
+  \item \textbf{Residual evaluation on LVN must use \texttt{complex128}.}
+    In \texttt{complex64}, cancellation errors of $\sim10^{-1}$\,p.u.\
+    swamp the true NR residual of $\sim10^{-9}$\,p.u., making model
+    residuals and the NR baseline numerically incomparable.
+    \texttt{complex128} baseline residuals are provided in
+    Table~\ref{tab:c128}; GNN model results will be added once evaluated.
+\end{itemize}
+
+\begin{thebibliography}{9}
+
+\bibitem{matpower}
+R.~D. Zimmerman, C.~E. Murillo-S\'{a}nchez, and R.~J. Thomas,
+``MATPOWER: Steady-state operations, planning, and analysis tools for
+power systems research and education,''
+\emph{IEEE Trans.\ Power Syst.}, vol.~26, no.~1, pp.~12--19, 2011.
+
+\bibitem{opfreview}
+D.~Molzahn and I.~Hiskens,
+``A survey of relaxations and approximations of the power flow equations,''
+\emph{Foundations and Trends in Electric Energy Systems}, vol.~4,
+no.~1--2, pp.~1--221, 2019.
+
+\bibitem{feasrestore}
+S.~Pineda and J.~M. Morales,
+``Feasibility of candidate solutions in gas and power networks,''
+\emph{IEEE Trans.\ Power Syst.}, 2022.
+(See also: arXiv:2209.04399, ``Restoring AC Power Flow Feasibility
+from Relaxed and Approximated OPF Models.'')
+
+\bibitem{pinnopf}
+A.~S. Zamzam and N.~D. Sidiropoulos,
+``Physics-informed machine learning for power flow with
+applications to DC-optimal power flow,''
+\emph{arXiv:2110.02672}, 2021.
+
+\end{thebibliography}
+
+\end{document}

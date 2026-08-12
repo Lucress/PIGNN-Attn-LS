@@ -11,6 +11,7 @@
 
 # Load necessary modules (modify based on environment)
 export PYTHONPATH=/home/hpc/iwi5/iwi5295h/PIGNN-Attn-LS/PIGNN-Attn-LS-PPC:$PYTHONPATH
+export PYTHONUNBUFFERED=1
 
 # Display allocated GPU info with nvidia-smi
 # You can also test accessing installed packages, e.g.:

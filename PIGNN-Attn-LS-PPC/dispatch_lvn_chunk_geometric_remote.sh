@@ -76,10 +76,30 @@ for idx in "${!labels[@]}"; do
 set -euo pipefail
 
 export PYTHONPATH=${base_quoted}:\${PYTHONPATH:-}
+export PYTHONUNBUFFERED=1
 module load python
 cd ${base_quoted}
 
-srun python train_valid_test.py --EPOCHS=${EPOCHS} --BATCH=${BATCH} --LR=${LR} --seed_value=${SEED} --train_ratio=0.3333 --valid_ratio=0.3333 --lr_scheduler=CosineAnnealingLR --PARQUET ${parquet_quoted} --vlimit --model GNSMsg_EdgeSelfAttn --lazy_parquet --row_group_cache_size=${ROW_GROUP_CACHE_SIZE} --armijo_mode=geometric --armijo_rho=${ARMIJO_RHO} --armijo_max_backtracks=${ARMIJO_MAX_BACKTRACKS} --armijo_min_alpha=${ARMIJO_MIN_ALPHA} --log_to_file --log_dir ${log_dir_quoted}${extra_args_joined}
+FINAL_LOG_DIR=${log_dir_quoted}
+LOCAL_PARQUET="\${TMPDIR}/input_\${SLURM_JOB_ID}.parquet"
+LOCAL_LOG_DIR="\${TMPDIR}/logs_\${SLURM_JOB_ID}"
+mkdir -p "\${LOCAL_LOG_DIR}"
+
+copy_back_outputs() {
+  status=\$?
+  mkdir -p "\${FINAL_LOG_DIR}"
+  cp -a "\${LOCAL_LOG_DIR}/." "\${FINAL_LOG_DIR}/" 2>/dev/null || true
+  exit \${status}
+}
+trap copy_back_outputs EXIT
+
+echo "[stage] copying parquet to \${LOCAL_PARQUET}"
+stage_start=\$(date +%s)
+cp ${parquet_quoted} "\${LOCAL_PARQUET}"
+stage_end=\$(date +%s)
+echo "[stage] parquet staging complete in \$((stage_end - stage_start)) seconds"
+
+srun python -u train_valid_test.py --EPOCHS=${EPOCHS} --BATCH=${BATCH} --LR=${LR} --seed_value=${SEED} --train_ratio=0.3333 --valid_ratio=0.3333 --lr_scheduler=CosineAnnealingLR --PARQUET "\${LOCAL_PARQUET}" --vlimit --model GNSMsg_EdgeSelfAttn --lazy_parquet --row_group_cache_size=${ROW_GROUP_CACHE_SIZE} --armijo_mode=geometric --armijo_rho=${ARMIJO_RHO} --armijo_max_backtracks=${ARMIJO_MAX_BACKTRACKS} --armijo_min_alpha=${ARMIJO_MIN_ALPHA} --log_to_file --log_dir ${REMOTE_LOG_DIR}${extra_args_joined}
 EOF2
 
   chmod +x "${script_path}"

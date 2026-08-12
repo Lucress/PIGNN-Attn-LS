@@ -1,3 +1,96 @@
-/CGMES_to_PandaPower_clean/
-/CGMES_to_PandaPower2/
+# ---------------------------------------------------------------------------
+# Vendored / cloned third-party repositories
+# Each of these is a separate upstream project cloned into this working tree.
+# They are NOT part of this repo; clone them with the commands in
+# PIGNN-Attn-LS-PPC/GRIDFM_GRIDSFM_WINDOWS_GPU_RUN.md
+# ---------------------------------------------------------------------------
 /CGMES_to_PandaPower/
+/CGMES_to_PandaPower2/
+/CGMES_to_PandaPower_clean/
+/differentiable-power-flow/
+/GridSFM/
+/gridfm-graphkit/
+/HELMpy/
+/hydraulic_surrogate/
+/LUMINA/
+/lumina-sdk/
+/thermal_surrogate/
+
+# ---------------------------------------------------------------------------
+# OS / editor / Python cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+.claude/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+# MS Office lock files
+~$*
+
+# ---------------------------------------------------------------------------
+# Generated datasets and model weights (too large for git)
+# ---------------------------------------------------------------------------
+*.parquet
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.mat
+*.h5
+*.hdf5
+/data/
+/output/
+/tmp/
+/PIGNN-Attn-LS-PPC/tmp/
+/PIGNN-Attn-LS-PPC/output/
+# exclude the contents (not the directory itself) so the negation below applies
+/ScenarioSynthesis_PPC/out/*
+# ...but keep the inspection helpers that live next to the generated parquet
+!/ScenarioSynthesis_PPC/out/*.py
+/PIGNN-Attn-LS-PPC/results/ckpt/
+
+# ---------------------------------------------------------------------------
+# Run artifacts: Slurm output, training logs, per-run metric dumps
+# ---------------------------------------------------------------------------
+*.out
+*.err
+*.log
+*_training_log.txt
+terminal_log_capture*.txt
+# per-run directories created under sbatch/ by the dispatch scripts
+/PIGNN-Attn-LS-PPC/sbatch/*/
+/ScenarioSynthesis_PPC/sbatch/*/
+/sbatch/*/
+# sbatch/previous/ holds hand-written job scripts, not run output
+!/sbatch/previous/
+/PIGNN-Attn-LS-PPC/results/logs/
+/PIGNN-Attn-LS-PPC/results/plots/
+
+# ---------------------------------------------------------------------------
+# Large binary documents and rendered figures
+# ---------------------------------------------------------------------------
+*.pptx
+*.docx
+*.pdf
+*.png
+*.zip
+
+# ---------------------------------------------------------------------------
+# LaTeX build products
+# ---------------------------------------------------------------------------
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.idx
+*.lof
+*.lot
+*.out.ps
+*.synctex.gz
+*.toc

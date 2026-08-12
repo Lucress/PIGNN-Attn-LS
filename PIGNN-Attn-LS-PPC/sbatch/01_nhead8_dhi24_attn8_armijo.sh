@@ -10,9 +10,10 @@
 #SBATCH --error=./Job_out/case14_36000_d4_dhi16_h4_attn1_k40_NR_plain.err
 
 export PYTHONPATH=/home/hpc/iwi5/iwi5295h/PIGNN-Attn-LS/PIGNN-Attn-LS-PPC:$PYTHONPATH
+export PYTHONUNBUFFERED=1
 module load python
 
 cd ..
 
 # Run your application or script
-srun python train_valid_test.py --d=4 --d_hi=16 --num_attn_layers=1 --n_heads=4 --K=40 --EPOCHS=100 --lr_scheduler=CosineAnnealingLR --PARQUET ../ScenarioSynthesis_PPC/out/case145_ppcY_A_dc_compile_siNR_36000_NR_branchrows_directSI.parquet --vlimit --model GNSMsg_EdgeSelfAttn
+srun python -u train_valid_test.py --d=4 --d_hi=16 --num_attn_layers=1 --n_heads=4 --K=40 --EPOCHS=100 --lr_scheduler=CosineAnnealingLR --PARQUET ../ScenarioSynthesis_PPC/out/case145_ppcY_A_dc_compile_siNR_36000_NR_branchrows_directSI.parquet --vlimit --model GNSMsg_EdgeSelfAttn

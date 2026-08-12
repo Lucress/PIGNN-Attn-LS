@@ -1,0 +1,300 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers}{natbib}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+\title{Per-Unit System: A Reference for Power-Flow Computations}
+
+\author{Changhun Kim}
+
+\begin{document}
+\maketitle
+
+%==============================================================================
+\section{The Four Base Quantities}
+%==============================================================================
+
+In the per-unit (p.u.) system, all electrical quantities are expressed as
+dimensionless ratios relative to a chosen \emph{base}.  There are four base
+quantities, but only \textbf{two are chosen freely}:
+
+\begin{itemize}[noitemsep]
+  \item $S_{\rm base}$ [VA] — one value for the entire system (commonly
+    $100\,\mathrm{MVA}$ for transmission, $1\,\mathrm{MVA}$ for distribution).
+  \item $V_{\rm base}$ [V] — one value \emph{per bus}, which can differ
+    across buses in a multi-voltage network.
+\end{itemize}
+
+The remaining two bases are \textbf{derived automatically}:
+
+\begin{equation}
+  I_{\rm base} = \frac{S_{\rm base}}{V_{\rm base}},
+  \qquad
+  Z_{\rm base} = \frac{V_{\rm base}^2}{S_{\rm base}},
+  \qquad
+  Y_{\rm base} = \frac{1}{Z_{\rm base}} = \frac{S_{\rm base}}{V_{\rm base}^2}
+  \label{eq:bases}
+\end{equation}
+
+The key relationship to remember: $Y_{\rm base}$ is proportional to
+$S_{\rm base}/V_{\rm base}^2$, so converting an admittance from SI to p.u.\
+\emph{multiplies} it by $V_{\rm base}^2/S_{\rm base}$.
+
+%==============================================================================
+\section{Conversion Formulas: SI $\to$ p.u.}
+%==============================================================================
+
+Every quantity is converted by dividing by its base:
+
+\begin{align}
+  V_{\rm pu} &= \frac{V_{\rm SI}}{V_{\rm base}}
+  \label{eq:vpu}\\[4pt]
+  I_{\rm pu} &= \frac{I_{\rm SI}}{I_{\rm base}}
+             = I_{\rm SI} \cdot \frac{V_{\rm base}}{S_{\rm base}}
+  \label{eq:ipu}\\[4pt]
+  S_{\rm pu} &= \frac{S_{\rm SI}}{S_{\rm base}}
+  \label{eq:spu}\\[4pt]
+  Y_{\rm pu} &= \frac{Y_{\rm SI}}{Y_{\rm base}}
+             = Y_{\rm SI} \cdot \frac{V_{\rm base}^2}{S_{\rm base}}
+  \label{eq:ypu}\\[4pt]
+  Z_{\rm pu} &= \frac{Z_{\rm SI}}{Z_{\rm base}}
+             = Z_{\rm SI} \cdot \frac{S_{\rm base}}{V_{\rm base}^2}
+  \label{eq:zpu}
+\end{align}
+
+Conductance $G$ and susceptance $B$ are the real and imaginary parts of $Y$,
+so they follow the same scaling:
+
+\begin{equation}
+  G_{\rm pu} = G_{\rm SI} \cdot \frac{V_{\rm base}^2}{S_{\rm base}},
+  \qquad
+  B_{\rm pu} = B_{\rm SI} \cdot \frac{V_{\rm base}^2}{S_{\rm base}}
+\end{equation}
+
+No separate treatment is needed; they scale identically to $Y$.
+
+%==============================================================================
+\section{The Admittance Matrix $Y_{\rm bus}$: Two-Bus Scaling}
+%==============================================================================
+
+Element $(i,j)$ of $Y_{\rm bus}$ relates bus $j$ current injection to bus
+$i$ voltage.  In a multi-voltage network $V_{{\rm base},i}$ and
+$V_{{\rm base},j}$ can differ.  Starting from the nodal current equation
+$I = Y_{\rm bus} V$ and applying per-unit conversion to both sides:
+
+\begin{equation}
+  \underbrace{\frac{I_{{\rm SI},i}}{I_{{\rm base},i}}}_{I_{{\rm pu},i}}
+  =
+  \sum_j
+  \underbrace{\left(
+    Y_{{\rm SI},ij} \cdot \frac{V_{{\rm base},j}}{I_{{\rm base},i}}
+  \right)}_{Y_{{\rm pu},ij}}
+  \cdot
+  \underbrace{\frac{V_{{\rm SI},j}}{V_{{\rm base},j}}}_{V_{{\rm pu},j}}
+\end{equation}
+
+Substituting $I_{{\rm base},i} = S_{\rm base}/V_{{\rm base},i}$:
+
+\begin{equation}
+  \boxed{
+    Y_{{\rm bus,pu},ij}
+    =
+    Y_{{\rm bus,SI},ij}
+    \cdot
+    \frac{V_{{\rm base},i} \cdot V_{{\rm base},j}}{S_{\rm base}}
+  }
+  \label{eq:ybuspu}
+\end{equation}
+
+The diagonal ($i=j$) reduces to:
+
+\begin{equation}
+  Y_{{\rm bus,pu},ii}
+  =
+  Y_{{\rm bus,SI},ii}
+  \cdot
+  \frac{V_{{\rm base},i}^2}{S_{\rm base}}
+\end{equation}
+
+which is exactly the scalar formula \eqref{eq:ypu} applied with the local
+bus base.
+
+In code, the full matrix conversion is a single outer-product multiply:
+
+\begin{verbatim}
+def ybus_si_to_pu(Y_si, Vbase_bus, S_base):
+    scale = np.outer(Vbase_bus, Vbase_bus) / S_base
+    return Y_si * scale
+\end{verbatim}
+
+\texttt{np.outer(Vbase\_bus, Vbase\_bus)} constructs the matrix
+$[V_{{\rm base},i} \cdot V_{{\rm base},j}]_{ij}$ in one call.
+
+%==============================================================================
+\section{Single-Voltage vs.\ Multi-Voltage Networks}
+%==============================================================================
+
+\paragraph{Single-voltage network} (all buses share the same $V_{\rm base}$):
+\begin{equation}
+  Y_{{\rm pu},ij} = Y_{{\rm SI},ij} \cdot \frac{V_{\rm base}^2}{S_{\rm base}}
+\end{equation}
+A single scalar multiplication suffices.
+
+\paragraph{Multi-voltage network} (e.g., Heo1: $3$--$380\,\mathrm{kV}$):
+\begin{equation}
+  Y_{{\rm pu},ij} = Y_{{\rm SI},ij} \cdot \frac{V_{{\rm base},i} \cdot V_{{\rm base},j}}{S_{\rm base}}
+\end{equation}
+An outer-product matrix must be used.  Using a single scalar $V_{\rm base}$
+would incorrectly scale the off-diagonal transformer branches (e.g.,
+$110\,\mathrm{kV} \leftrightarrow 20\,\mathrm{kV}$), causing the Ybus to be
+wrong and all downstream power-flow residuals to be corrupted.
+
+This is the root cause of one of the LVN bugs described in the experimental
+results.
+
+%==============================================================================
+\section{Branch Admittance Entries}
+%==============================================================================
+
+The PPC dataset stores per-branch admittance quantities.  Each carries a
+different scaling depending on which bus end it is associated with:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Quantity & Associated end & Conversion factor \\
+\midrule
+\texttt{y\_series\_from} & from-bus self-admittance & $\times\, V_f^2 / S_{\rm base}$ \\
+\texttt{y\_series\_to}   & to-bus self-admittance   & $\times\, V_t^2 / S_{\rm base}$ \\
+\texttt{y\_series\_ft}   & from–to mutual term      & $\times\, V_f V_t / S_{\rm base}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The mutual term \texttt{y\_series\_ft} uses the product of \emph{both} bus
+bases, consistent with \eqref{eq:ybuspu}.  In code:
+
+\begin{verbatim}
+Branch_y_series_from *= Vf**2 / S_base
+Branch_y_series_to   *= Vt**2 / S_base
+Branch_y_series_ft   *= Vf * Vt / S_base
+\end{verbatim}
+
+%==============================================================================
+\section{Consistency Check: Power Equation in p.u.}
+%==============================================================================
+
+A key property of the per-unit system is that the power-flow equations
+retain the same algebraic form.  Starting from $S_{\rm SI} = V_{\rm SI}
+\cdot \overline{I_{\rm SI}}$:
+
+\begin{equation}
+  S_{\rm pu}
+  = \frac{S_{\rm SI}}{S_{\rm base}}
+  = \frac{V_{\rm SI} \cdot \overline{I_{\rm SI}}}{S_{\rm base}}
+  = \frac{V_{\rm SI}}{V_{\rm base}}
+    \cdot \overline{\frac{I_{\rm SI}}{I_{\rm base}}}
+    \cdot \underbrace{\frac{V_{\rm base} \cdot I_{\rm base}}{S_{\rm base}}}_{=\,1}
+  = V_{\rm pu} \cdot \overline{I_{\rm pu}}
+\end{equation}
+
+So $S_{\rm pu} = V_{\rm pu} \cdot \overline{I_{\rm pu}}$ holds in p.u.\ with
+no additional factors.  Similarly, the Newton--Raphson power-flow equation
+
+\begin{equation}
+  S_i = V_i \cdot \overline{(Y_{\rm bus}\, V)_i}
+\end{equation}
+
+holds \emph{identically} in both SI and p.u., which is the fundamental
+advantage of the per-unit system: the solver code is the same regardless of
+the physical scale.
+
+%==============================================================================
+\section{Changing $S_{\rm base}$ (Re-basing)}
+%==============================================================================
+
+If $V_{\rm base}$ is kept fixed and only $S_{\rm base}$ changes from
+$S_1 \to S_2$:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Quantity & Transformation & Direction \\
+\midrule
+$V_{\rm pu}$   & unchanged              & — \\
+$S_{\rm pu}$   & $\times\, S_1/S_2$    & same as $S$ \\
+$Y_{\rm pu}$   & $\times\, S_1/S_2$    & same as $S$ \\
+$I_{\rm pu}$   & $\times\, S_1/S_2$    & same as $S$ \\
+$Z_{\rm pu}$   & $\times\, S_2/S_1$    & inverse of $S$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Practical example: LVN re-basing from 1\,MVA to 100\,MVA.}
+LVN datasets (e.g., Heo1) are often generated with $S_{\rm base} =
+1\,\mathrm{MVA}$.  Most HV/MV models use $100\,\mathrm{MVA}$.  Re-basing
+from $1\,\mathrm{MVA}$ to $100\,\mathrm{MVA}$ ($S_2 / S_1 = 100$):
+
+\begin{itemize}[noitemsep]
+  \item $V_{\rm pu}$: \textbf{unchanged}.
+  \item $S_{\rm pu}$, $Y_{\rm pu}$, $\Delta P$, $\Delta Q$:
+    \textbf{divided by 100} (100$\times$ smaller).
+  \item $Z_{\rm pu}$: multiplied by 100.
+\end{itemize}
+
+The physical solution is identical; only the numerical scale of the
+quantities seen by the model changes.  After re-basing, the LVN residuals
+$\Delta P$, $\Delta Q$ will be on the same order of magnitude as HV/MV
+cases, which helps the loss landscape match what the model was trained on.
+
+%==============================================================================
+\section{Summary Table}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\caption{Per-unit conversion factors (SI $\to$ p.u.) for all key quantities.
+  Single-voltage: one global $V_{\rm base}$.
+  Multi-voltage: per-bus $V_{{\rm base},i}$.}
+\label{tab:pu_summary}
+\begin{tabular}{llcc}
+\toprule
+Quantity & Multiply by & Single-voltage & Multi-voltage \\
+\midrule
+$V$          & $1/V_{\rm base}$
+             & per-bus scalar & per-bus scalar \\
+$S$          & $1/S_{\rm base}$
+             & global scalar  & global scalar \\
+$I$          & $V_{\rm base}/S_{\rm base}$
+             & per-bus scalar & per-bus scalar \\
+$G,\,B,\,Y$ & $V_{\rm base}^2/S_{\rm base}$
+             & one scalar     & per-bus scalar \\
+$Y_{{\rm bus},ij}$ & $V_{{\rm base},i}\cdot V_{{\rm base},j}/S_{\rm base}$
+             & one scalar     & \textbf{outer-product matrix} \\
+$Z$          & $S_{\rm base}/V_{\rm base}^2$
+             & one scalar     & per-bus scalar \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The only entry that requires a full matrix operation is
+$Y_{{\rm bus},ij}$ in the multi-voltage case.  All other quantities are
+element-wise operations.  The PPC code's
+\texttt{np.outer(Vbase\_bus, Vbase\_bus)\,/\,S\_base} is correct for the
+general case and reduces to the scalar formula when all bus bases are equal.
+
+\end{document}

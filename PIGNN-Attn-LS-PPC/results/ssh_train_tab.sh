@@ -37,13 +37,14 @@ for i in $(seq 1 18); do
               -e 'delay 0.2'
   fi
 
-  train_cmd="python train_valid_test.py --d=4 --d_hi=16 --num_attn_layers=1 --n_heads=4 --K=40 --EPOCHS=100 --lr_scheduler=CosineAnnealingLR --PARQUET ../ScenarioSynthesis_PPC/out/$f --vlimit $armijo --model GNSMsg_EdgeSelfAttn"
+  train_cmd="python -u train_valid_test.py --d=4 --d_hi=16 --num_attn_layers=1 --n_heads=4 --K=40 --EPOCHS=100 --lr_scheduler=CosineAnnealingLR --PARQUET ../ScenarioSynthesis_PPC/out/$f --vlimit $armijo --model GNSMsg_EdgeSelfAttn"
 
   osascript -e "tell application \"Terminal\" to do script \"ssh $host\" in selected tab of front window" \
             -e 'delay 1.0' \
             -e 'tell application "Terminal" to do script "clear" in selected tab of front window' \
             -e 'tell application "Terminal" to do script "conda activate /proj/aimi-adl/envs/adl23_2/" in selected tab of front window' \
             -e 'tell application "Terminal" to do script "export PYTHONPATH=~/Desktop/PIGNN-Attn-LS/PIGNN-Attn-LS-PPC:$PYTHONPATH" in selected tab of front window' \
+export PYTHONUNBUFFERED=1
             -e 'tell application "Terminal" to do script "cd ~/Desktop/PIGNN-Attn-LS/PIGNN-Attn-LS-PPC" in selected tab of front window' \
             -e "tell application \"Terminal\" to do script \"$train_cmd\" in selected tab of front window"
 done

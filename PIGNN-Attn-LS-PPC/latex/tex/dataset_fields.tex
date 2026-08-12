@@ -1,0 +1,349 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers}{natbib}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  frame=single,
+  xleftmargin=1em,
+}
+
+\title{Dataset Field Reference:\\
+  Grid-Only Cache vs.\ Per-Row Fields in \texttt{ChanghunDataset}}
+
+\author{Changhun Kim}
+
+\begin{document}
+\maketitle
+
+%==============================================================================
+\section{Motivation: Why Cache Grid-Only Fields?}
+%==============================================================================
+
+Each row of a power-flow Parquet dataset contains two fundamentally
+different kinds of data:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Grid structure} — topology, admittances, bus types.
+    These are \emph{identical} across all 36{,}000 scenarios in a single
+    dataset file.
+  \item \textbf{Per-scenario perturbations} — load/generation setpoints,
+    initial voltages, Newton--Raphson solutions.
+    These are \emph{unique} to every row.
+\end{itemize}
+
+For a large grid such as LVN Heo1 ($N=722$ buses, $n_l=796$ branches),
+the dense admittance matrix $Y_{\rm bus}$ alone occupies $722^2 \times
+8\,\mathrm{B} \approx 4.17\,\mathrm{MB}$ per row.  Storing one copy per
+row would require $4.17\,\mathrm{MB} \times 36{,}000 = 150\,\mathrm{GB}$
+of RAM --- almost entirely for data that never changes.
+
+\texttt{Dataset\_optimized\_complex\_columns.py} avoids this by decoding
+the grid-structure fields \emph{once}, storing a single shared copy, and
+referencing it from every row.
+
+%==============================================================================
+\section{The 20 Cached Grid-Only Fields}
+%==============================================================================
+
+Up to 20 fields are identified as grid-only and cached at dataset
+initialisation.  They are grouped by physical meaning below.
+
+\subsection{Bus Features (3 fields)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{bus\_type}   & int64   & $(N,)$ & Bus classification: PQ=0, Slack=1, PV=2 \\
+\texttt{vn\_kv}      & float32 & $(N,)$ & Rated bus voltage [kV]
+                                           (e.g.\ 3, 20, 110, 380) \\
+\texttt{V\_base\_bus} & float32 & $(N,)$ & Per-bus voltage base [V]
+                                           $= \texttt{vn\_kv} \times 1000$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{V\_base\_bus} is derived from \texttt{vn\_kv} and is stored
+separately because it is used repeatedly in per-unit conversions (see
+the per-unit reference document).
+
+\subsection{Bus Shunt (1 field)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{Y\_shunt\_bus} & complex64 & $(N,)$ &
+  Per-bus shunt admittance (p.u.) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Shunt admittances (capacitor banks, reactors) are fixed grid equipment;
+they do not vary with load/generation scenarios.
+
+\subsection{Branch Topology (3 fields)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{Branch\_f\_bus}  & int64 & $(n_l,)$ & From-bus index of each branch \\
+\texttt{Branch\_t\_bus}  & int64 & $(n_l,)$ & To-bus index of each branch \\
+\texttt{Branch\_status}  & int8  & $(n_l,)$ & Branch in-service flag (1/0) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Transformer Parameters (2 fields)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{Branch\_tau}       & float32 & $(n_l,)$ & Tap ratio $\tau$ \\
+\texttt{Branch\_shift\_deg} & float32 & $(n_l,)$ & Phase shift [degrees] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both are properties of the physical transformer winding; they are fixed
+for a given grid and do not change between operating scenarios.
+
+\subsection{Branch Admittances (5 fields, per-unit)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{Branch\_y\_series\_from} & complex64 & $(n_l,)$ &
+  Series admittance, from-bus self-term \\
+\texttt{Branch\_y\_series\_to}   & complex64 & $(n_l,)$ &
+  Series admittance, to-bus self-term \\
+\texttt{Branch\_y\_series\_ft}   & complex64 & $(n_l,)$ &
+  Series admittance, from-to mutual term \\
+\texttt{Branch\_y\_shunt\_from}  & complex64 & $(n_l,)$ &
+  Shunt admittance at from end \\
+\texttt{Branch\_y\_shunt\_to}    & complex64 & $(n_l,)$ &
+  Shunt admittance at to end \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These five entries encode the $\pi$-model of each branch and are already
+converted to per-unit using the appropriate bus-base scaling:
+$\texttt{y\_series\_from} \times V_f^2/S_{\rm base}$,
+$\texttt{y\_series\_to} \times V_t^2/S_{\rm base}$, and
+$\texttt{y\_series\_ft} \times V_f V_t/S_{\rm base}$
+(see the per-unit reference for the derivation).
+
+\subsection{Branch Flags and Counts (3 fields)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{Is\_trafo}      & int8   & $(n_l,)$ & Transformer flag (1=trafo, 0=line) \\
+\texttt{Branch\_hv\_is\_f} & int8 & $(n_l,)$ &
+  Whether the from-bus is the HV side (transformers only) \\
+\texttt{Branch\_n}      & float32 & $(n_l,)$ & Number of parallel circuits \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{Is\_trafo} is used by the model to apply transformer-specific
+attention features.  \texttt{Branch\_hv\_is\_f} encodes the winding
+orientation, which determines the correct direction of the tap ratio.
+
+\subsection{Line Admittances (2 fields)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{Y\_Lines}   & complex64 & $(n_l,)$ &
+  Line series admittance (p.u.) \\
+\texttt{Y\_C\_Lines} & float32  & $(n_l,)$ &
+  Line shunt susceptance (p.u.) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Dense Admittance Matrix (1 field, conditional)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{Ybus} & complex64 & $(N, N)$ &
+  Full nodal admittance matrix (p.u.) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is the dominant contributor to RAM usage (see Section~\ref{sec:memory}).
+It is cached unless \texttt{\_no\_cache\_dense\_ybus=True} is set, giving a
+total of \textbf{20 fields} (or 19 without \texttt{Ybus}).
+
+The relevant code in \texttt{Dataset\_optimized\_complex\_columns.py}:
+
+\begin{lstlisting}[language=Python]
+grid_field_names = [
+    "bus_type", "vn_kv", "V_base_bus", "Y_shunt_bus",
+    "Branch_f_bus", "Branch_t_bus", "Branch_status",
+    "Branch_tau", "Branch_shift_deg",
+    "Branch_y_series_from", "Branch_y_series_to", "Branch_y_series_ft",
+    "Branch_y_shunt_from", "Branch_y_shunt_to",
+    "Is_trafo", "Branch_hv_is_f", "Branch_n",
+    "Y_Lines", "Y_C_Lines",
+]
+if not self._no_cache_dense_ybus:
+    grid_field_names.append("Ybus")
+\end{lstlisting}
+
+%==============================================================================
+\section{Memory Footprint per Field}
+\label{sec:memory}
+%==============================================================================
+
+Table~\ref{tab:memory} gives the byte size of each cached field for the
+LVN Heo1 grid ($N=722$, $n_l=796$).
+
+\begin{table}[h]
+\centering
+\caption{Per-field memory usage for LVN Heo1 ($N=722$, $n_l=796$).
+  complex64 = 8 B; float32 = 4 B; int64 = 8 B; int8 = 1 B.}
+\label{tab:memory}
+\begin{tabular}{llr}
+\toprule
+Field(s) & Calculation & Size \\
+\midrule
+\texttt{Ybus}
+  & $722 \times 722 \times 8\,\mathrm{B}$
+  & $\mathbf{4.17\,\mathrm{MB}}$ \\
+\texttt{Branch\_y\_*} (5 fields)
+  & $796 \times 8\,\mathrm{B} \times 5$
+  & $31.8\,\mathrm{kB}$ \\
+\texttt{Y\_Lines}
+  & $796 \times 8\,\mathrm{B}$
+  & $6.4\,\mathrm{kB}$ \\
+\texttt{Y\_C\_Lines}
+  & $796 \times 4\,\mathrm{B}$
+  & $3.2\,\mathrm{kB}$ \\
+\texttt{Y\_shunt\_bus}
+  & $722 \times 8\,\mathrm{B}$
+  & $5.8\,\mathrm{kB}$ \\
+\texttt{vn\_kv}, \texttt{V\_base\_bus}
+  & $722 \times 4\,\mathrm{B} \times 2$
+  & $5.8\,\mathrm{kB}$ \\
+\texttt{bus\_type}
+  & $722 \times 8\,\mathrm{B}$
+  & $5.8\,\mathrm{kB}$ \\
+\texttt{Branch\_f\_bus}, \texttt{Branch\_t\_bus}
+  & $796 \times 8\,\mathrm{B} \times 2$
+  & $12.7\,\mathrm{kB}$ \\
+\texttt{Branch\_status}, \texttt{Is\_trafo}, \texttt{Branch\_hv\_is\_f}
+  & $796 \times 1\,\mathrm{B} \times 3$
+  & $2.4\,\mathrm{kB}$ \\
+\texttt{Branch\_tau}, \texttt{Branch\_shift\_deg}, \texttt{Branch\_n}
+  & $796 \times 4\,\mathrm{B} \times 3$
+  & $9.6\,\mathrm{kB}$ \\
+\midrule
+\textbf{Total (one shared copy)}
+  & &
+  $\mathbf{\approx 4.25\,\mathrm{MB}}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$Y_{\rm bus}$ accounts for $\sim\!98\%$ of the cached footprint.
+Without grid-field sharing, loading all 36{,}000 rows would require
+$4.25\,\mathrm{MB} \times 36{,}000 \approx 153\,\mathrm{GB}$, almost
+entirely due to $Y_{\rm bus}$.  The shared cache reduces this to a
+single 4.25\,MB copy.
+
+%==============================================================================
+\section{The 8 Per-Row (Non-Cached) Fields}
+%==============================================================================
+
+The following fields vary across scenarios and cannot be shared:
+
+\begin{table}[h]
+\centering
+\caption{Per-row fields (perturbation-dependent, one copy per scenario).}
+\label{tab:perrow}
+\begin{tabular}{llll}
+\toprule
+Field & dtype & Shape & Description \\
+\midrule
+\texttt{U\_start}  & complex64 & $(N,)$    & Initial voltage phasor \\
+\texttt{U\_newton} & complex64 & $(N,)$    & NR converged voltage phasor \\
+\texttt{V\_start}  & float32   & $(N, 2)$  & $[|V|, \angle V]$ of initial voltage \\
+\texttt{V\_newton} & float32   & $(N, 2)$  & $[|V|, \angle V]$ of NR solution \\
+\texttt{S\_start}  & complex64 & $(N,)$    & Initial complex power injection \\
+\texttt{S\_newton} & complex64 & $(N,)$    & NR converged power injection \\
+\texttt{S\_base}   & float32   & scalar    & System apparent power base \\
+\texttt{U\_base}   & float32   & scalar    & System voltage base \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These represent the operating condition (load profile, generation dispatch)
+for each scenario.  \texttt{V\_newton} is the supervised learning target;
+\texttt{S\_start} provides the power setpoints $P^{\rm set}$, $Q^{\rm set}$
+that enter the physics loss.
+
+%==============================================================================
+\section{Summary}
+%==============================================================================
+
+\begin{itemize}[noitemsep]
+  \item \textbf{20 grid-only fields} (19 without \texttt{Ybus}) are decoded
+    once at dataset init and shared across all rows.
+  \item $Y_{\rm bus}$ dominates: it is $\sim\!98\%$ of the cached footprint
+    (4.17\,MB out of 4.25\,MB for Heo1).
+  \item Without sharing, 36k rows of Heo1 would require $\sim\!153\,\mathrm{GB}$
+    of RAM; with sharing, only $\sim\!4.25\,\mathrm{MB}$ is needed for the
+    grid structure.
+  \item \textbf{8 per-row fields} hold the scenario-specific perturbations
+    (voltages, power injections) and are stored individually.
+  \item Setting \texttt{\_no\_cache\_dense\_ybus=True} drops \texttt{Ybus}
+    from the cache; the model then reconstructs it on-the-fly from the
+    branch admittance fields.
+\end{itemize}
+
+\end{document}

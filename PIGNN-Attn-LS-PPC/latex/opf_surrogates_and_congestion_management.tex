@@ -1,0 +1,304 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=24mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,tabularx,array}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+\usepackage{lmodern}
+
+\definecolor{navy}{HTML}{17365D}
+\definecolor{blue}{HTML}{2F75B5}
+\definecolor{pale}{HTML}{EEF4FA}
+\definecolor{softgray}{HTML}{F4F5F7}
+\definecolor{darkgray}{HTML}{404040}
+
+\hypersetup{colorlinks=true,linkcolor=navy,urlcolor=blue}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.55em}
+\setlist[itemize]{leftmargin=1.5em,itemsep=0.2em,topsep=0.25em}
+\setlist[enumerate]{leftmargin=1.7em,itemsep=0.2em,topsep=0.25em}
+\renewcommand{\arraystretch}{1.22}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{darkgray}OPF Surrogates and Congestion Management}
+\fancyhead[R]{\small\color{darkgray}Technical Explanation}
+\fancyfoot[C]{\small\color{darkgray}\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\newtcolorbox{keybox}[1][]{
+  colback=pale,colframe=blue,boxrule=0.7pt,arc=2pt,
+  left=8pt,right=8pt,top=7pt,bottom=7pt,#1}
+\newtcolorbox{summarybox}[1][]{
+  colback=softgray,colframe=darkgray,boxrule=0.5pt,arc=2pt,
+  left=8pt,right=8pt,top=7pt,bottom=7pt,#1}
+\newcommand{\model}[1]{\textcolor{navy}{\textbf{#1}}}
+\newcommand{\R}{\mathrm}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries\color{navy}Neural OPF Surrogates and\\[2pt]Simulation-Based Congestion Management}\par
+  \vspace{0.55em}
+  {\large How GridFM, GridSFM, and LUMINA differ from classical OPF,\\and how the thesis method differs from full AC-OPF}\par
+  \vspace{0.7em}
+  {\color{darkgray}\small Consolidated technical explanation}
+\end{center}
+
+\vspace{0.8em}
+\begin{keybox}
+\textbf{Central message.} GridFM, GridSFM, and LUMINA do not solve a Karush--Kuhn--Tucker (KKT) system at inference in the way that IPOPT or another nonlinear OPF solver does. They learn a direct approximation of the final OPF solution. Likewise, the thesis method is not a full AC-OPF: it is a congestion-management optimization in which particle swarm optimization (PSO) selects curtailment actions and PowerFactory evaluates the resulting grid state.
+\end{keybox}
+
+\section{Classical AC Optimal Power Flow}
+
+A conventional AC optimal power flow (AC-OPF) computes a complete operating point by repeatedly adjusting primal and dual variables, for example
+\[
+P_g,\;Q_g,\;V,\;\theta,\;\lambda,\;\mu,
+\]
+until the objective, the AC equations, operational inequalities, and the KKT conditions meet the requested numerical tolerances. A typical formulation is
+\begin{align}
+\min_{P_g,Q_g,V,\theta}\quad & \sum_g C_g(P_g),\\
+\text{subject to}\quad & g(P_g,Q_g,V,\theta)=0,\\
+& P_g^{\min}\le P_g\le P_g^{\max},\qquad
+Q_g^{\min}\le Q_g\le Q_g^{\max},\\
+& V^{\min}\le V\le V^{\max},\qquad
+|S_{ij}|\le S_{ij}^{\max}.
+\end{align}
+Thus, classical OPF asks: \emph{What is the cheapest feasible complete operating point for this grid instance?}
+
+\section{The Common Surrogate-Learning Idea}
+
+GridFM, GridSFM, and LUMINA instead learn a mapping
+\[
+\boxed{\text{grid data, loads, limits, and costs}}
+\quad\longrightarrow\quad
+\boxed{\widehat P_g,\widehat Q_g,\widehat V,\widehat\theta}.
+\]
+Conventional solvers first generate target solutions
+\(P_g^\star,Q_g^\star,V^\star,\theta^\star\). A supervised loss then teaches the neural network to imitate those solutions:
+\[
+\mathcal L_{\mathrm{sup}}=
+\|\widehat P_g-P_g^\star\|^2+
+\|\widehat Q_g-Q_g^\star\|^2+
+\|\widehat V-V^\star\|^2+
+\|\widehat\theta-\theta^\star\|^2.
+\]
+This alone is insufficient: a numerically close prediction may still violate Kirchhoff's current law (KCL), a voltage limit, or a thermal limit. The models therefore combine some of the following mechanisms:
+\begin{enumerate}
+  \item solver-generated supervision;
+  \item differentiable penalties for physical residuals and violations;
+  \item output transformations that enforce selected box limits;
+  \item post-prediction feasibility and violation checks.
+\end{enumerate}
+
+For example, predicted active- and reactive-power balance residuals at bus~$i$ may be written as
+\begin{align}
+r_i^P &= \widehat P_{g,i}-P_{d,i}-P_i(\widehat V,\widehat\theta),\\
+r_i^Q &= \widehat Q_{g,i}-Q_{d,i}-Q_i(\widehat V,\widehat\theta),
+\end{align}
+with a soft penalty
+\[
+\mathcal L_{\mathrm{KCL}}=\sum_i\bigl[(r_i^P)^2+(r_i^Q)^2\bigr].
+\]
+Reducing this loss encourages power balance, but it does not guarantee that every residual is exactly zero after one forward pass.
+
+\section{How the Three Neural Models Handle OPF}
+
+\subsection{GridFM: masked reconstruction of solver outputs}
+
+\model{GridFM} represents power flow and OPF as masked reconstruction tasks. In OPF mode, quantities such as $P_g$, $Q_g$, $V$, and $\theta$ are hidden and predicted, while limits, costs, and other problem-defining information are visible inputs. The distinction is intuitive:
+\begin{itemize}
+  \item in power flow, dispatch and voltage setpoints are largely given;
+  \item in OPF, dispatch and voltage quantities must be inferred;
+  \item consequently, OPF inputs expose relevant limits and cost information.
+\end{itemize}
+
+Physics-informed balance losses can penalize the KCL residuals above. Operational violations may be represented through hinge-type measures such as
+\begin{align}
+v_i^{\mathrm{viol}} &= \max(0,V_i^{\min}-\widehat V_i)
+ +\max(0,\widehat V_i-V_i^{\max}),\\
+s_{ij}^{\mathrm{viol}} &= \max(0,|\widehat S_{ij}|-S_{ij}^{\max}).
+\end{align}
+Depending on the configuration, limits can appear as inputs, physics-related losses, or evaluation metrics. The architecture primarily learns to reproduce solver outputs, so not every physical inequality is necessarily enforced exactly.
+
+GridFM learns economic dispatch mainly through imitation: $\widehat P_g\approx P_g^\star$, where $P_g^\star$ was produced by a cost-minimizing OPF solver. Hence cost is not irrelevant, but the neural forward pass does not itself run a mathematical optimization over the cost function.
+
+\subsection{GridSFM: explicit physics, cost, and feasibility terms}
+
+\model{GridSFM} explicitly predicts
+\[
+\widehat\theta,\quad\widehat V,\quad\widehat P_g,\quad\widehat Q_g,
+\]
+along with a feasibility score. Branch flows are computed analytically from the predicted bus state using the AC $\pi$-model; they are not arbitrary independent outputs.
+
+The training objective separates supervised prediction, active and reactive KCL residuals, branch loading, thermal constraints, voltage bounds, cost, and feasibility classification. Schematically, its KCL contribution has the form
+\[
+\lambda_{P}\log(1+\mathcal L_{\mathrm{KCL},P})+
+\lambda_{Q}\log(1+\mathcal L_{\mathrm{KCL},Q}),
+\]
+where the logarithm limits the dominance of very large residuals. These remain soft conditions at standalone inference.
+
+Generator and voltage bounds are strengthened through bounded output transformations, conceptually
+\[
+\widehat P_g=\operatorname{bounded}(P_g^{\mathrm{raw}},P_g^{\min},P_g^{\max}),
+\]
+and similarly for $Q_g$ and $V$. Thermal loading is calculated from
+\[
+|\widehat S_{ij}|=\sqrt{\widehat P_{ij}^{,2}+\widehat Q_{ij}^{,2}},
+\qquad
+r_{ij}^{\mathrm{thermal}}=\max(0,|\widehat S_{ij}|-S_{ij}^{\max}),
+\]
+then penalized. A small overload can therefore remain. Angle constraints are handled less directly, mainly through stress and feasibility information rather than a simple hard clipping rule.
+
+GridSFM combines dispatch imitation with a cost-matching term. For quadratic generation costs,
+\[
+\widehat C=\sum_g\left(c_{2,g}\widehat P_g^2+c_{1,g}\widehat P_g+c_{0,g}\right),
+\]
+and a representative loss is
+\[
+\mathcal L_{\mathrm{cost}}=
+\left[\log(1+\widehat C)-\log(1+C^\star)\right]^2.
+\]
+It does not minimize $\widehat C$ in isolation, which could lead to a trivial low-generation prediction. Instead, it learns the cost-optimal feasible solution by combining supervision, balance, bounds, thermal penalties, cost matching, and feasibility classification.
+
+GridSFM can also provide a warm start to PowerModels.jl and IPOPT. In that hybrid mode, the neural output is an initialization; IPOPT subsequently solves the actual constrained optimization problem to tolerance.
+
+\subsection{LUMINA: bounded outputs and augmented-Lagrangian training}
+
+\model{LUMINA} likewise predicts approximately $\widehat V$, $\widehat\theta$, $\widehat P_g$, and $\widehat Q_g$. With min--max output scaling enabled, sigmoid transformations can enforce box constraints by construction, for example
+\[
+\widehat V=V^{\min}+\sigma(z_V)(V^{\max}-V^{\min}),
+\]
+so that $V^{\min}<\widehat V<V^{\max}$. The same principle applies to $P_g$ and $Q_g$.
+
+Its constraint-aware training can use an augmented-Lagrangian objective of the conceptual form
+\[
+\mathcal L=\mathcal L_{\mathrm{sup}}+lambda^\top r(\widehat x)
++\frac{\rho}{2}\|r(\widehat x)\|^2,
+\]
+where $r(\widehat x)$ contains physical residuals. Although this resembles the classical Lagrangian, the interpretation differs: an interior-point solver finds per-instance primal and dual variables, whereas neural training uses multiplier-like quantities and penalties across a dataset to shape future predictions.
+
+The safest conclusion is that box constraints on $V$, $P_g$, and $Q_g$ can be guaranteed when bounded scaling is active. Thermal and angle constraints may influence training and evaluation, but the inference pass does not perform an interior-point solve that certifies them. Economic optimality is learned primarily from solver-generated dispatch labels and, depending on the selected loss configuration, from cost or constrained-objective terms.
+
+\subsection{Compact comparison}
+
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries}p{0.205\textwidth}XXX}
+\toprule
+OPF aspect & GridFM & GridSFM & LUMINA\\
+\midrule
+Primary idea & Masked reconstruction & Explicit multi-term surrogate & Constraint-aware surrogate\\
+Predicted state & $P_g,Q_g,V,\theta$ & $P_g,Q_g,V,\theta$ plus feasibility & $P_g,Q_g,V,\theta$\\
+KCL equality & Physics/balance loss & Explicit residual losses & Lagrangian or violation penalty\\
+Box limits & Inputs, loss, or metrics by setup & Bounded transformation & Sigmoid min--max scaling\\
+Thermal limits & Configuration-dependent loss or evaluation & Explicit soft thermal penalty & Constraint-aware loss/evaluation\\
+Cost & Mainly solver-label imitation & Imitation plus cost matching & Labels plus selected objective\\
+Exact KKT solve at inference & No & No & No\\
+\bottomrule
+\end{tabularx}
+\normalsize
+
+\begin{summarybox}
+\textbf{Mental model.}
+\[
+\begin{array}{c}
+\text{Classical OPF: solve one constrained optimization problem per instance.}\\[5pt]
+\text{Neural surrogate: solve many OPFs offline, train once, then predict in one pass.}
+\end{array}
+\]
+Only constraints embedded in the output architecture are guaranteed. Penalty-based constraints can still be violated.
+\end{summarybox}
+
+\section{OPF Versus Congestion Management}
+
+OPF and congestion management are closely related but not identical. Congestion management is the broader operational task: detect a congestion, select suitable interventions, test their grid impact, and relieve the congestion with as little intervention as possible. OPF is one possible tool for selecting an operating point; rule-based methods, metaheuristics, redispatch procedures, and other strategies can serve the same operational application.
+
+The thesis uses PSO and repeated PowerFactory simulations rather than a full AC-OPF formulation. Its principal control variables are relative photovoltaic and wind curtailment levels at selected forecast points:
+\[
+0\le u_{\mathrm{PV},k}(t)\le1,
+\qquad
+0\le u_{\mathrm{WIND},k}(t)\le1.
+\]
+They modify the injections according to
+\begin{align}
+P_{\mathrm{PV},k}^{\mathrm{new}}(t)
+&=\bigl(1-u_{\mathrm{PV},k}(t)\bigr)P_{\mathrm{PV},k}(t),\\
+P_{\mathrm{WIND},k}^{\mathrm{new}}(t)
+&=\bigl(1-u_{\mathrm{WIND},k}(t)\bigr)P_{\mathrm{WIND},k}(t).
+\end{align}
+
+For each candidate, PowerFactory solves a steady-state power flow. The resulting line and transformer loadings, voltage conditions, and curtailed energy determine the PSO fitness. The division of labor is therefore
+\begin{center}
+\scriptsize
+$\boxed{\text{PSO proposes curtailment}}\;\longrightarrow\;
+\boxed{\text{PowerFactory solves power flow}}\;\longrightarrow\;
+\boxed{\text{violations and fitness return to PSO}}.$
+\end{center}
+PowerFactory is the physical evaluator; PSO searches the restricted intervention space.
+
+\subsection{Different variables, objectives, and constraint treatment}
+
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries}p{0.23\textwidth}XX}
+\toprule
+Feature & Standard AC-OPF & Thesis congestion management\\
+\midrule
+Scope & Complete operating point & Selected curtailment actions\\
+Decision variables & $P_g,Q_g,V,\theta$ and controls & Mainly PV/wind curtailment factors\\
+Primary objective & Generation cost & Congestion relief and minimal intervention\\
+AC physics & Explicit optimization equalities & Solved externally by PowerFactory\\
+Search method & Gradient-based nonlinear programming & Derivative-free PSO\\
+Time representation & Commonly one snapshot & 15-minute data and rolling horizon\\
+Output & Economically optimal dispatch & Operational redispatch proposal\\
+\bottomrule
+\end{tabularx}
+\normalsize
+
+The thesis objective has the weighted structure
+\[
+J(t)=w_{\mathrm{band}}P_{\mathrm{band}}(t)
++w_{\mathrm{glob}}P_{\mathrm{glob}}(t)
++w_EE_{\mathrm{curt}}(t)
++w_AN_{\mathrm{actions}}(t)
++w_SS(t).
+\]
+Its components express a clear operational priority:
+\begin{enumerate}
+  \item $P_{\mathrm{band}}$: relieve the target congestion without unnecessary over-curtailment;
+  \item $P_{\mathrm{glob}}$: avoid creating a new congestion elsewhere;
+  \item $E_{\mathrm{curt}}$: minimize curtailed renewable energy;
+  \item $N_{\mathrm{actions}}$: use as few control levers as practical;
+  \item $S(t)$: avoid abrupt changes between consecutive time steps.
+\end{enumerate}
+This is a congestion-management objective rather than a conventional fuel-cost objective. Market costs, compensation, reactive-power management, topology control, and full contingency optimization remain outside the chosen scope.
+
+Most network limits are represented through the fitness function instead of KKT-style constraints internal to PSO. Strong penalties discourage unsafe candidates. After continuous optimization, actions are projected onto discrete operational levels such as
+\[
+\{0,30,60,100\}\%.
+\]
+The projected solution is simulated again; if violations remain, action levels are increased iteratively until the grid is safe.
+
+\section{Final Interpretation}
+
+\begin{keybox}
+\textbf{Neural OPF models.} GridFM, GridSFM, and LUMINA approximate the final primal OPF solution directly. They do not reproduce the classical multiplier, slack-variable, and Newton/KKT iterations during inference. Architectural transformations can guarantee selected box constraints; physics and inequality penalties only encourage feasibility.
+\end{keybox}
+
+\begin{keybox}
+\textbf{Thesis method.} The developed method is not a conventional full AC-OPF. It is a simulation-based congestion-management optimization in which PSO selects renewable curtailment actions while PowerFactory evaluates the resulting steady-state network state. The objective prioritizes congestion relief and global grid security, followed by curtailed energy, the number of interventions, and temporal smoothness.
+\end{keybox}
+
+\subsection*{Report-ready concise statement}
+
+The proposed approach is OPF-like because it optimizes grid-control actions under operational limits, but it is not a standard full AC-OPF. Only selected active-power curtailments are decision variables; reactive power, transformer taps, switching states, and the complete generator dispatch are not optimized. The AC equations are solved externally in PowerFactory, while PSO minimizes a penalty-based congestion-management objective over a rolling horizon. The resulting method is best described as \emph{PSO-based redispatch optimization with PowerFactory power-flow evaluation}.
+
+\vfill
+{\footnotesize\color{darkgray}\textit{Scope note.} Model-specific statements may depend on repository version, checkpoint, and training configuration. In particular, direct cost handling in GridFM and the treatment of thermal and angle limits in LUMINA should be described cautiously unless verified against the exact implementation used.}
+
+\end{document}

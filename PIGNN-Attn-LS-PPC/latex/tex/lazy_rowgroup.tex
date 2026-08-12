@@ -1,0 +1,296 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers}{natbib}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  frame=single,
+  xleftmargin=1em,
+}
+
+\title{Lazy Row-Group Loading in \texttt{ChanghunDataset}:\\
+  Design, Trade-offs, and the LVN Bottleneck}
+
+\author{Changhun Kim}
+
+\begin{document}
+\maketitle
+
+%==============================================================================
+\section{Why Lazy Loading Is Needed}
+%==============================================================================
+
+In the eager (default) loading mode every row of the Parquet file is read,
+decoded, and converted to PyTorch tensors at dataset initialisation time.
+For small cases this is fine, but for large graphs the memory requirement is
+prohibitive.
+
+A single row of an $N$-bus dataset contains:
+\begin{itemize}[noitemsep]
+  \item \texttt{Y\_matrix}: $N \times N$ complex64 $\;\to\;$ $8N^2$ bytes.
+  \item \texttt{Y\_Lines}: $\binom{N}{2}$ complex64 entries.
+  \item \texttt{u\_start}, \texttt{u\_newton}, \texttt{S\_start},
+    \texttt{S\_newton}: $N$-vectors.
+\end{itemize}
+
+For \textbf{case1354} ($N=1354$), one row's \texttt{Y\_matrix} alone is
+$8 \times 1354^2 \approx 14.7\,\mathrm{MB}$.  Storing 36{,}000 rows eagerly
+would require $\sim\!530\,\mathrm{GB}$ of RAM — completely infeasible.
+Lazy row-group mode was introduced to solve this.
+
+%==============================================================================
+\section{Parquet Row Groups: The Building Block}
+%==============================================================================
+
+A Parquet file is physically organised into \emph{row groups} — independent
+chunks that can be read from disk without touching the rest of the file:
+
+\begin{lstlisting}
+LVN_36k.parquet  (1.1 GB on disk)
+  Row Group 0   :  20 rows  (~620 KB)
+  Row Group 1   :  20 rows
+  ...
+  Row Group 1799:  20 rows
+\end{lstlisting}
+
+Because each row group is self-contained, the dataset can read only the
+row groups it currently needs and discard the rest.
+
+%==============================================================================
+\section{Eager Mode: Simple, Fast, Memory-Heavy}
+%==============================================================================
+
+\begin{lstlisting}[language=Python]
+ChanghunDataset(path, lazy_row_groups=False)   # default
+\end{lstlisting}
+
+\paragraph{Initialisation.}
+The entire Parquet file is read once; every row is decoded and converted to
+tensors.  The result is stored as \texttt{self.rows = [dict\_0, dict\_1,
+\ldots]}, fully resident in RAM.
+
+\paragraph{Item access.}
+\texttt{\_\_getitem\_\_(idx)} is a single list index operation --- microsecond
+latency, the GPU is never starved.
+
+\paragraph{Trade-off.}
+RAM usage equals the full dataset size.  Unusable for large-$N$ cases.
+
+%==============================================================================
+\section{Lazy Row-Group Mode: Chunked Read with LRU Cache}
+%==============================================================================
+
+\begin{lstlisting}[language=Python]
+ChanghunDataset(path, lazy_row_groups=True, row_group_cache_size=2)
+\end{lstlisting}
+
+\subsection{Initialisation (\texttt{\_build\_lazy\_row\_group\_index})}
+
+Only the Parquet \emph{metadata} is scanned --- no payload data is decoded.
+For each row group the initialiser records:
+\begin{itemize}[noitemsep]
+  \item its row-group index and the number of rows it contains;
+  \item which of those rows passed the divergence filter (a lightweight
+    read of \texttt{u\_newton} only).
+\end{itemize}
+
+The result is a compact index table \texttt{self.\_row\_group\_metas}
+(tens of MB at most) and an empty LRU cache
+\texttt{self.\_row\_group\_cache = OrderedDict()}.
+
+\subsection{Item Access at Training Time}
+
+\texttt{\_\_getitem\_\_(idx)} proceeds in three steps:
+
+\begin{enumerate}[noitemsep]
+  \item \textbf{Map index to row group.}
+    Binary search over \texttt{\_row\_group\_metas} finds the row group $g$
+    that contains row \texttt{idx}, and the local offset $r$ within $g$.
+  \item \textbf{Cache lookup.}
+    \begin{itemize}[noitemsep]
+      \item \textit{Cache hit}: row group $g$ is already in
+        \texttt{\_row\_group\_cache} $\to$ return row $r$ immediately.
+      \item \textit{Cache miss}: read row group $g$ from disk, decode all
+        binary columns, convert to tensors, insert into cache.
+        If the cache exceeds \texttt{row\_group\_cache\_size}, evict the
+        least-recently-used entry.
+    \end{itemize}
+  \item \textbf{Return} row $r$ from the (now-populated) cache entry for
+    group $g$.
+\end{enumerate}
+
+\subsection{Cache Visualisation}
+
+With \texttt{row\_group\_cache\_size=2} the in-memory footprint at any
+moment is at most two row groups (e.g.\ 40 rows for a 20-row/group file):
+
+\begin{lstlisting}
+  _row_group_cache (OrderedDict, max 2 entries)
+  +--------------------+  +--------------------+
+  |  Row Group 617     |  |  Row Group 1203    |
+  |  20 decoded rows   |  |  20 decoded rows   |
+  +--------------------+  +--------------------+
+         ^-- most recent
+
+  Next batch requests Row Group 99:
+    -> evict Row Group 1203 (oldest)
+    -> load Row Group 99 from disk
+\end{lstlisting}
+
+%==============================================================================
+\section{Comparison: Eager vs.\ Lazy}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\caption{Eager vs.\ lazy row-group mode.}
+\label{tab:eager_vs_lazy}
+\begin{tabular}{lll}
+\toprule
+Aspect & Eager & Lazy row-group \\
+\midrule
+Init time        & Long (decode everything)   & Short (metadata only) \\
+Init RAM         & Full dataset               & Index only ($\sim$tens MB) \\
+\texttt{\_\_getitem\_\_} latency
+                 & Microseconds               & Disk I/O + decode on miss \\
+Sequential access & Fast                      & Fast (many cache hits) \\
+Random / shuffled & Fast                      & Slow (many cache misses) \\
+RAM at runtime   & Full dataset               & $\propto$ cache size \\
+Best for         & Small $N$, small datasets  & Large $N$ ($\geq$1000 buses) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
+\section{Cache Hit Rate Analysis}
+%==============================================================================
+
+Under random shuffling, the expected cache hit rate is approximately:
+
+\begin{equation}
+  \text{hit rate}
+  \;\approx\;
+  \frac{\text{cache size (row groups)}}{\text{total row groups}}
+  \label{eq:hitrate}
+\end{equation}
+
+Table~\ref{tab:hitrate} shows how this plays out for different cases with
+the same 36{,}000-row dataset and \texttt{cache=2}.
+
+\begin{table}[h]
+\centering
+\caption{Approximate cache hit rate under random shuffling
+  (\texttt{cache=2}, 36k rows).}
+\label{tab:hitrate}
+\begin{tabular}{lrrl}
+\toprule
+Case & Row groups & Hit rate & Consequence \\
+\midrule
+case300 (36k)  & 6    & $2/6    = 33\%$ & Tolerable \\
+case1354 (36k) & 120  & $2/120  = 1.6\%$ & Slow \\
+LVN (36k)      & 1800 & $2/1800 = 0.1\%$ & \textbf{Catastrophic} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For the LVN 36k dataset, almost every \texttt{\_\_getitem\_\_} call triggers
+a full disk read and decode cycle.  This is the root cause of the
+$\sim\!15$--$16\,\mathrm{min/epoch}$ wall time observed in the LVN training
+runs.
+
+The underlying reason is that the LVN Parquet was written with a very small
+row-group size (20 rows/group), producing 1{,}800 groups for 36{,}000 rows.
+By contrast, case300 uses 6{,}000 rows/group, so the same 36{,}000 rows fit
+in only 6 groups and the cache works as intended.
+
+%==============================================================================
+\section{Remedies}
+%==============================================================================
+
+\subsection{Option A: Increase Cache Size (Immediate)}
+
+\begin{lstlisting}
+--row_group_cache_size 200
+\end{lstlisting}
+
+Raising the cache from 2 to 200 row groups raises the hit rate from
+$0.1\%$ to $200/1800 \approx 11\%$ and reduces disk I/O by roughly
+$10\times$.  The RAM cost is $200 \times 20\,\text{rows} \times
+(\text{row size})$; for LVN with $N \approx 722$ buses this is
+approximately $200 \times 20 \times 4\,\text{MB} \approx 16\,\text{GB}$
+of additional RAM.
+
+\subsection{Option B: Re-write the Parquet with Larger Row Groups
+  (Root Fix)}
+
+Re-generating the LVN Parquet in \texttt{ScenarioSynthesis\_PPC} with a
+larger \texttt{row\_group\_size} (e.g.\ 2{,}000):
+
+\begin{lstlisting}[language=Python]
+table.write_to_dataset(..., row_group_size=2000)
+\end{lstlisting}
+
+reduces the number of row groups from 1{,}800 to 18, so a cache of size 2
+already covers $11\%$ of the dataset --- the same hit rate as Option~A but
+without the extra RAM.  This is the preferred long-term fix.
+
+\subsection{Option C: Sparse In-Memory Format}
+
+Store the dataset in RAM using a sparse tensor representation so that even
+case1354-scale grids fit in a reasonable memory budget.  Lazy mode then
+only needs to perform the tensor type conversion, not disk I/O.
+
+%==============================================================================
+\section{Intuitive Analogy}
+%==============================================================================
+
+\textbf{Eager mode} is like spreading an entire book flat on a desk: any
+page is one finger-movement away, but the desk must be large enough to hold
+the whole book.
+
+\textbf{Lazy mode} is like keeping the book on a shelf and bringing only a
+few chapters to the desk at a time.  This works well when:
+\begin{itemize}[noitemsep]
+  \item chapters are large (few of them $\to$ high cache hit rate), and
+  \item access is somewhat sequential.
+\end{itemize}
+It fails when chapters are very thin (many of them) and reading order is
+random --- exactly the situation with LVN's 1{,}800-group Parquet under
+shuffled training.
+
+%==============================================================================
+\section{Summary}
+%==============================================================================
+
+\begin{itemize}[noitemsep]
+  \item Lazy row-group mode avoids RAM OOM for large-$N$ graphs by reading
+    only the Parquet row groups that are currently needed, keeping the rest
+    on disk behind an LRU cache.
+  \item Cache hit rate $\approx$ cache size / total row groups under random
+    access.  A small cache is only effective when row groups are large.
+  \item The LVN 36k Parquet has 1{,}800 row groups of 20 rows each.  With
+    cache size 2, the hit rate is $0.1\%$, making nearly every training step
+    a disk read.
+  \item The root cause is the small \texttt{row\_group\_size} used when the
+    LVN Parquet was written.  The fix is either to increase the cache size
+    at training time or to re-write the Parquet with larger row groups.
+\end{itemize}
+
+\end{document}

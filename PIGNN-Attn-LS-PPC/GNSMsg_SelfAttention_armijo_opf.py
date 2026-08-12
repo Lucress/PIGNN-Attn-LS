@@ -86,6 +86,7 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
         S,                      # load-only injection (S_load), NOT a full setpoint
         V0,
         ctrl_mask,              # True where the OPF may redispatch
+        ref_mask=None,          # angle datum; REQUIRED -- conventions differ
         n_nodes_per_graph=None,
         Y_shunt_bus=None,
         vn_log=None,
@@ -151,7 +152,20 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
         # The optimiser owns the voltage profile, so nothing is frozen except
         # the angle datum -- kept fixed purely to remove the global-rotation
         # gauge freedom, exactly as the PF slack does.
-        ref_mask = (bus_type == 1)
+        #
+        # `ref_mask` must be supplied by the caller because the bus_type coding
+        # is pipeline specific: the PPC branch-row schema uses 1=slack, while
+        # OPFData follows MATPOWER with 1=PQ, 2=PV, 3=ref. Defaulting to the PF
+        # convention silently froze the angle at every PQ bus on OPFData and
+        # flatlined training, so guessing here is not acceptable.
+        if ref_mask is None:
+            raise ValueError(
+                "ref_mask is required: bus_type coding differs per pipeline "
+                "(PPC 1=slack, OPFData/MATPOWER 3=ref)."
+            )
+        ref_mask = ref_mask.to(torch.bool)
+        if ref_mask.dim() == 1:
+            ref_mask = ref_mask.unsqueeze(0)
         free_th = ~ref_mask
         free_v = torch.ones_like(ref_mask)
 

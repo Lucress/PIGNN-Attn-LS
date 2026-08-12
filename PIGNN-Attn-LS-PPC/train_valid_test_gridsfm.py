@@ -46,6 +46,12 @@ from opf_task import (
     gen_head_loss,
     target_dispatch,
 )
+from known_operator_pf import (
+    add_known_operator_args,
+    build_known_operator,
+    format_known_operator_diagnostics,
+    known_operator_tag,
+)
 
 
 BUS_TYPE_PQ = 1
@@ -150,6 +156,7 @@ def parse_args():
         default=0.0,
         help="Fallback GridSFM branch rate_a feature when the parquet has no rate.",
     )
+    add_known_operator_args(parser)
     return parser.parse_args()
 
 
@@ -434,9 +441,18 @@ def run():
     args = parse_args()
     set_seed(args.seed_value)
 
+    if args.task != "pf" and args.kol_pf_mode != "off":
+        raise ValueError(
+            "--kol_pf_mode solves a specified-injection PF and cannot be used "
+            "for --task opf, where dispatch remains a decision variable."
+        )
+
     if not args.run_name:
         mode = "pre" if args.init_mode == "pretrained" else "scratch"
-        args.run_name = f"gridsfm_{mode}_{Path(args.PARQUET).stem}"
+        args.run_name = (
+            f"gridsfm_{mode}_{known_operator_tag(args)}_"
+            f"{Path(args.PARQUET).stem}"
+        )
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
@@ -466,6 +482,7 @@ def run():
         f"[loss] mse_weight={args.mse_weight} physics_weight={args.physics_weight} "
         f"physics_form={args.physics_loss_form}"
     )
+    print(f"[known-operator] {known_operator_tag(args)} raw_loss_weight={args.kol_raw_loss_weight:g}")
 
     dataset = ChanghunDataset(
         args.PARQUET,
@@ -506,6 +523,10 @@ def run():
         print(f"[init] loaded state_dict: {args.resume_state_dict}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] trainable_params={n_params:,}")
+    known_operator = build_known_operator(args)
+    if known_operator is not None:
+        known_operator = known_operator.to(device)
+        print(f"[known-operator] {known_operator}")
 
     optim = torch.optim.AdamW(
         model.parameters(),
@@ -533,6 +554,10 @@ def run():
         dp_values = []
         dq_values = []
         opf_sums: Dict[str, float] = {}
+        kol_initial_values = []
+        kol_final_values = []
+        kol_converged_values = []
+        kol_iteration_values = []
 
         with torch.set_grad_enabled(train):
             for batch_cpu in loader:
@@ -578,11 +603,25 @@ def run():
                     space_cpu = space_dev = None
                 want_gen = is_opf and (args.gen_head_weight > 0.0)
                 if want_gen:
-                    Vpred, gen_pred, gen_bus = gridsfm_forward(
+                    Vraw, gen_pred, gen_bus = gridsfm_forward(
                         model, batch_cpu, args, device, opf_space=space_cpu, return_gen=True)
                 else:
-                    Vpred = gridsfm_forward(model, batch_cpu, args, device, opf_space=space_cpu)
+                    Vraw = gridsfm_forward(model, batch_cpu, args, device, opf_space=space_cpu)
                     gen_pred = gen_bus = None
+
+                kol_diag = None
+                if known_operator is not None:
+                    Vpred, kol_diag = known_operator(
+                        Vraw,
+                        Y_metric,
+                        Sstart_metric,
+                        bus_type,
+                        V_fixed=batch_dev["V_start"],
+                        sizes=n_nodes,
+                        differentiable=train,
+                    )
+                else:
+                    Vpred = Vraw
 
                 dmag = Vpred[..., 0] - target[..., 0]
                 dang = angle_diff(Vpred[..., 1], target[..., 1])
@@ -607,6 +646,21 @@ def run():
                         huber_delta=args.physics_huber_delta,
                     )
                 loss = args.mse_weight * mse + args.physics_weight * phys
+                if known_operator is not None and args.kol_raw_loss_weight > 0.0:
+                    raw_dmag = Vraw[..., 0] - target[..., 0]
+                    raw_dang = angle_diff(Vraw[..., 1], target[..., 1])
+                    raw_mse = torch.mean(raw_dmag * raw_dmag) + torch.mean(raw_dang * raw_dang)
+                    raw_phys = ppc_physics_loss(
+                        Y_metric.to(torch.complex64),
+                        Vraw,
+                        Sstart_metric.to(torch.complex64),
+                        bus_type,
+                        form=args.physics_loss_form,
+                        huber_delta=args.physics_huber_delta,
+                    )
+                    loss = loss + args.kol_raw_loss_weight * (
+                        args.mse_weight * raw_mse + args.physics_weight * raw_phys
+                    )
                 if is_opf and (args.dispatch_weight > 0.0 or args.gen_head_weight > 0.0):
                     tgt_gen = target_dispatch(batch_dev, space_dev, device)
                     if tgt_gen is not None:
@@ -653,12 +707,25 @@ def run():
                     & (residual_metrics["max_dq_pu"] < args.convergence_tol_pu)
                 )
                 n_conv += int(conv.sum().item())
+                if kol_diag is not None:
+                    kol_initial_values.append(kol_diag["initial_max_mismatch"].detach().cpu())
+                    kol_final_values.append(kol_diag["final_max_mismatch"].detach().cpu())
+                    kol_converged_values.append(kol_diag["converged"].detach().cpu())
+                    kol_iteration_values.append(kol_diag["iterations"].detach().cpu())
 
         denom = max(n_graphs, 1)
         dist = residual_distribution(dp_values, dq_values, args.residual_tol_pu)
         dist["convergence_rate"] = n_conv / denom
         dist["n_converged"] = n_conv
         dist["n_cases"] = n_graphs
+        kol_summary = None
+        if kol_final_values:
+            kol_summary = {
+                "initial_max_mismatch": torch.cat(kol_initial_values),
+                "final_max_mismatch": torch.cat(kol_final_values),
+                "converged": torch.cat(kol_converged_values),
+                "iterations": torch.cat(kol_iteration_values),
+            }
         return {
             "loss": sum_loss / denom,
             "mse": sum_mse / denom,
@@ -671,6 +738,7 @@ def run():
             "max_dq_mva": sum_max_dq_mva / denom,
             "dist": dist,
             "opf": {k: v / denom for k, v in opf_sums.items()} if opf_sums else None,
+            "kol": kol_summary,
         }
 
     def fmt(prefix, m):
@@ -688,7 +756,8 @@ def run():
             f"rmse {rmse:.4e} (mag {rmse_mag:.4e}, ang {rmse_ang_deg:.4e}deg) "
             f"(dPinf {m['max_dp_pu']:.3e} pu, dQinf {m['max_dq_pu']:.3e} pu; "
             f"{m['max_dp_mva']:.3e} MW, {m['max_dq_mva']:.3e} MVAr) "
-            f"{format_residual_distribution_compact(m['dist'])}"
+            f"{format_residual_distribution_compact(m['dist'])} "
+            f"{format_known_operator_diagnostics(m.get('kol'))}"
         )
 
     print("Initial metrics before training:")

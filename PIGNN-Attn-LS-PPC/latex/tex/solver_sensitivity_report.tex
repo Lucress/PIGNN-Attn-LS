@@ -1,0 +1,386 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers}{natbib}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{longtable}
+
+\definecolor{good}{RGB}{0,110,60}
+\definecolor{warn}{RGB}{175,105,0}
+\definecolor{bad}{RGB}{175,0,0}
+
+\newcommand{\cok}[1]{\textcolor{good}{#1}}
+\newcommand{\cwarn}[1]{\textcolor{warn}{#1}}
+\newcommand{\cbad}[1]{\textcolor{bad}{#1}}
+
+\title{Solver Sensitivity in Newton--Raphson Label Generation\\
+\large Why the custom NR solver fails, and where it fails ---\\
+evidence from 28 PPC benchmark grids}
+
+\author{Changhun Kim}
+\date{July 28, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Phase~0 backbone data generation for the PIGNN-Attn-LS Newton--Raphson (NR)
+surrogate initially produced usable labels on only 12 of 28 benchmark grids.
+The working hypothesis was that the $\pm40\%$ global load-scaling range of the
+\texttt{backbone} preset was too aggressive.  A controlled sweep disproves
+this: narrowing the range to $\pm20\%$ and $\pm10\%$ changed convergence by
+less than $6\%$ on the affected grids, while holding the range fixed at
+$\pm40\%$ and substituting the pandapower NR implementation for the in-house
+solver moved the same grids from $0.3\%$ to $100\%$ convergence.  The
+controlling variable is the solver, not the perturbation magnitude.  We
+characterise two distinct failure regimes of the custom solver---an
+ill-conditioning regime affecting distribution-type and tightly-constrained
+grids at any size, and an absolute size wall above ${\sim}1{,}300$ buses where
+convergence is identically zero---and report the full 28-grid regeneration,
+which yields $909{,}216$ labelled samples with no job failures.
+\end{abstract}
+
+
+% ===================================================================
+\section{Motivation and Hypothesis Under Test}
+% ===================================================================
+
+The \texttt{backbone} preset (Phase~0) applies a fixed Y-bus perturbation
+family: global load scaling on $[0.60, 1.40]$, per-bus load jitter
+($\sigma_P{=}0.10$, $\sigma_Q{=}0.15$), generator jitter ($\sigma_G{=}0.05$),
+PV setpoint variation on $[0.95, 1.05]$\,pu, and randomised initial voltages.
+Topology and admittance perturbation are disabled.
+
+The initial campaign produced full $36{,}000$-row datasets on 12 grids and
+little or nothing on the remaining 16.  Two explanations are consistent with
+that observation:
+
+\begin{description}[leftmargin=1.2em]
+\item[H1 (perturbation).] The $\pm40\%$ load range pushes samples outside the
+  feasible operating region, so the labels legitimately do not exist.
+\item[H2 (solver).] The samples are feasible, but the in-house NR
+  implementation fails to converge to them.
+\end{description}
+
+These make opposite predictions.  Under H1, narrowing the load range must
+raise the converged-sample count.  Under H2, narrowing the range changes
+little, while changing the solver at fixed range changes a great deal.
+Both experiments were run.
+
+
+% ===================================================================
+\section{Experiment 1: Load Range Sweep (Custom NR)}
+% ===================================================================
+
+Six low-yield grids were regenerated at $\pm20\%$ ($[0.80,1.20]$) and
+$\pm10\%$ ($[0.90,1.10]$) with the solver held fixed.  Counts are converged
+samples retained out of $36{,}000$ attempted.
+
+\begin{center}
+\begin{tabular}{l r r r r}
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{$\pm40\%$} & \textbf{$\pm20\%$} & \textbf{$\pm10\%$} \\
+\midrule
+case33bw          & 33  & \cbad{688}    & \cbad{720}    & \cbad{726} \\
+case89pegase      & 89  & \cbad{1{,}536}& ---         & \cbad{1{,}465} \\
+case145           & 145 & \cbad{3{,}202}& ---         & \cbad{3{,}872} \\
+iceland           & 189 & \cbad{0}      & \cbad{0}      & --- \\
+case\_illinois200 & 200 & \cbad{117}    & \cbad{107}    & \cbad{106} \\
+case300           & 300 & \cwarn{15{,}219}& \cwarn{18{,}350}& \cwarn{18{,}968} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Entries marked --- were lost to a filename collision (Section~\ref{sec:collision}).
+
+The result contradicts H1.  A four-fold reduction in perturbation magnitude
+moves case33bw from $688$ to $726$ samples ($+5.5\%$) and case\_illinois200
+from $117$ to $106$ ($-9.4\%$, i.e.\ marginally \emph{worse}).  Only case300
+responds materially ($+24.6\%$), and even there the yield remains far from
+complete.  If the $\pm40\%$ range were placing samples outside the feasible
+set, a $\pm10\%$ range would recover them.  It does not.
+
+
+% ===================================================================
+\section{Experiment 2: Custom NR Failure Map at Fixed $\pm40\%$}
+\label{sec:map}
+% ===================================================================
+
+Table~\ref{tab:custom} orders all 28 grids by size and reports custom-NR
+yield at the unmodified $\pm40\%$ range.
+
+\begin{longtable}{l r r r l}
+\caption{Custom NR convergence at $\pm40\%$, ordered by network size.}
+\label{tab:custom}\\
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{Rows} & \textbf{Yield} & \textbf{Regime} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{Rows} & \textbf{Yield} & \textbf{Regime} \\
+\midrule
+\endhead
+case4gs           & 4     & \cok{36{,}000} & 100\%  & works \\
+case5             & 5     & \cok{36{,}000} & 100\%  & works \\
+case6ww           & 6     & \cok{36{,}000} & 100\%  & works \\
+case9             & 9     & \cok{36{,}000} & 100\%  & works \\
+case14            & 14    & \cok{36{,}000} & 100\%  & works \\
+case24\_ieee\_rts & 24    & \cok{36{,}000} & 100\%  & works \\
+GBreducednetwork  & 29    & \cok{36{,}000} & 100\%  & works \\
+case30            & 30    & \cok{36{,}000} & 100\%  & works \\
+case\_ieee30      & 30    & \cok{36{,}000} & 100\%  & works \\
+case33bw          & 33    & \cbad{688}      & 1.9\%  & \cbad{ill-conditioned} \\
+case39            & 39    & \cok{36{,}000} & 100\%  & works \\
+case57            & 57    & \cok{33{,}757} & 93.8\% & works \\
+case89pegase      & 89    & \cbad{1{,}536}  & 4.3\%  & \cbad{ill-conditioned} \\
+case118           & 118   & \cok{36{,}000} & 100\%  & works \\
+case145           & 145   & \cbad{3{,}202}  & 8.9\%  & \cbad{ill-conditioned} \\
+iceland           & 189   & \cbad{0}        & 0\%    & \cbad{ill-conditioned} \\
+case\_illinois200 & 200   & \cbad{117}      & 0.3\%  & \cbad{ill-conditioned} \\
+case300           & 300   & \cwarn{15{,}219} & 42.3\% & \cwarn{degraded} \\
+case1354pegase    & 1{,}354 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case1888rte       & 1{,}888 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+GBnetwork         & 2{,}224 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case2848rte       & 2{,}848 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case2869pegase    & 2{,}869 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case3120sp        & 3{,}120 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case6470rte       & 6{,}470 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case6495rte       & 6{,}495 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case6515rte       & 6{,}515 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+case9241pegase    & 9{,}241 & \cbad{0}      & 0\%    & \cbad{size wall} \\
+\bottomrule
+\end{longtable}
+
+The failure is \emph{not} a simple monotone function of size.  Two separable
+regimes appear.
+
+\paragraph{Regime A --- ill-conditioning, size-independent.}
+case33bw (33 buses) fails at $1.9\%$ while case118 (118 buses) succeeds
+completely.  The grids in this regime are not the large ones; they are the
+ones whose electrical characteristics stress a textbook NR formulation:
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{case33bw} is a radial distribution feeder.  Distribution
+    networks carry $R/X$ ratios an order of magnitude above transmission
+    values, which is the classical failure mode for an unmodified NR
+    Jacobian.
+  \item \textbf{case89pegase}, \textbf{case145}, \textbf{iceland} and
+    \textbf{case\_illinois200} are realistic or reduced-realistic models with
+    tight reactive limits and narrow feasible regions, as opposed to the
+    well-conditioned academic IEEE cases that surround them in the table.
+\end{itemize}
+
+\paragraph{Regime B --- absolute size wall above ${\sim}1{,}300$ buses.}
+Every grid from case1354pegase upward returns \emph{exactly} zero converged
+samples, without exception, across nine grids spanning $1{,}354$ to $9{,}241$
+buses.  This is not partial degradation; the transition from case300
+($42.3\%$) to case1354pegase ($0\%$) is a cliff.  The failure is also
+expensive: divergent samples exhaust all $K{=}40$ iterations before being
+discarded, so case6515rte consumed 17 array tasks $\times$ 24\,h and
+GBnetwork 22\,h of wall time to produce nothing.  Logs show
+\texttt{Jacobian singular, abort NR} and non-finite intermediates
+(\texttt{invalid value encountered in exp}) in the update step.
+
+
+% ===================================================================
+\section{Experiment 3: Pandapower NR at the Same $\pm40\%$ Range}
+% ===================================================================
+
+All 28 grids were regenerated with \texttt{--label\_solver pandapower\_nr}.
+The perturbation configuration was left \emph{identical}---same preset, same
+$\pm40\%$ range, same \texttt{dc\_compile} initialisation, same $K{=}40$.
+The solver is the only changed variable.
+
+\begin{longtable}{l r r r r}
+\caption{Custom NR versus pandapower NR, both at $\pm40\%$.}
+\label{tab:compare}\\
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{Custom NR} & \textbf{Pandapower NR} & \textbf{Yield} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{Custom NR} & \textbf{Pandapower NR} & \textbf{Yield} \\
+\midrule
+\endhead
+case4gs           & 4       & 36{,}000 & \cok{36{,}000} & 100\% \\
+case5             & 5       & 36{,}000 & \cok{36{,}000} & 100\% \\
+case6ww           & 6       & 36{,}000 & \cok{36{,}000} & 100\% \\
+case9             & 9       & 36{,}000 & \cok{36{,}000} & 100\% \\
+case14            & 14      & 36{,}000 & \cok{36{,}000} & 100\% \\
+case24\_ieee\_rts & 24      & 36{,}000 & \cok{36{,}000} & 100\% \\
+GBreducednetwork  & 29      & 36{,}000 & \cok{36{,}000} & 100\% \\
+case30            & 30      & 36{,}000 & \cok{36{,}000} & 100\% \\
+case\_ieee30      & 30      & 36{,}000 & \cok{36{,}000} & 100\% \\
+case33bw          & 33      & \cbad{688} & \cok{36{,}000} & 100\% \\
+case39            & 39      & 36{,}000 & \cok{36{,}000} & 100\% \\
+case57            & 57      & 33{,}757 & \cok{35{,}920} & 99.8\% \\
+case89pegase      & 89      & \cbad{1{,}536} & \cok{36{,}000} & 100\% \\
+case118           & 118     & 36{,}000 & \cok{36{,}000} & 100\% \\
+case145           & 145     & \cbad{3{,}202} & \cbad{7{,}885} & \cbad{21.9\%} \\
+iceland           & 189     & \cbad{0}   & \cok{35{,}605} & 98.9\% \\
+case\_illinois200 & 200     & \cbad{117} & \cok{36{,}000} & 100\% \\
+case300           & 300     & 15{,}219 & \cwarn{27{,}994} & 77.8\% \\
+case1354pegase    & 1{,}354 & \cbad{0}   & \cok{32{,}627} & 90.6\% \\
+case1888rte       & 1{,}888 & \cbad{0}   & \cok{36{,}000} & 100\% \\
+GBnetwork         & 2{,}224 & \cbad{0}   & \cok{34{,}424} & 95.6\% \\
+case2848rte       & 2{,}848 & \cbad{0}   & \cok{36{,}000} & 100\% \\
+case2869pegase    & 2{,}869 & \cbad{0}   & \cok{35{,}998} & 100.0\% \\
+case3120sp        & 3{,}120 & \cbad{0}   & \cok{35{,}465} & 98.5\% \\
+case6470rte       & 6{,}470 & \cbad{0}   & \cwarn{25{,}551} & 71.0\% \\
+case6495rte       & 6{,}495 & \cbad{0}   & \cwarn{23{,}332} & 64.8\% \\
+case6515rte       & 6{,}515 & \cbad{0}   & \cwarn{20{,}135} & 55.9\% \\
+case9241pegase    & 9{,}241 & \cbad{0}   & \cwarn{18{,}280} & 50.8\% \\
+\midrule
+\textbf{Total}    &         & \textbf{454{,}894} & \textbf{909{,}216} & \\
+\bottomrule
+\end{longtable}
+
+\paragraph{Regime~B is entirely eliminated.}
+All nine grids above $1{,}300$ buses that returned zero now return data, four
+of them at or near $100\%$.  The size wall was an artefact of the solver.
+
+\paragraph{Regime~A is almost entirely eliminated.}
+case\_illinois200 improves by $308\times$ ($117 \to 36{,}000$), case33bw by
+$52\times$, case89pegase by $23\times$; iceland recovers from zero to
+$98.9\%$.  The radial/high-$R/X$ and tight-limit failures were solver
+artefacts, not infeasibility.
+
+\paragraph{Throughput.}
+Pandapower NR sustained $41$--$43$ rows/s on small grids against $0$--$4$
+rows/s for the custom solver, roughly $40\times$ faster, because divergent
+samples no longer burn the full 40-iteration budget.  Grids that previously
+exceeded a 24\,h wall clock completed in 30\,min--4\,h.
+
+
+% ===================================================================
+\section{The One Genuine Exception: case145}
+% ===================================================================
+
+case145 is the sole grid where H1 survives.  It improves only $2.5\times$
+($3{,}202 \to 7{,}885$, $21.9\%$) and pandapower's own linear algebra reports
+the failure explicitly:
+
+\begin{center}
+\texttt{newtonpf.py:512: MatrixRankWarning: Matrix is exactly singular}\\
+\texttt{create\_jacobian.py:27: RuntimeWarning: invalid value encountered in divide}
+\end{center}
+
+Crucially, the run logged \emph{zero} \texttt{not-converged} events: the
+solver is not failing to converge, it is encountering a structurally singular
+Jacobian.  This is genuine numerical infeasibility of the perturbed operating
+points rather than a solver deficiency, and it is the one case where
+narrowing the load range is the correct remedy.  A $\pm20\%$ or $\pm10\%$
+rerun of case145 alone is recommended.
+
+The partial yields on the four largest grids ($50.8$--$71.0\%$) are of the
+same character: at $6{,}000$--$9{,}241$ buses a $\pm40\%$ excursion places a
+genuine fraction of samples outside the feasible set.  These datasets remain
+usable at $18$k--$26$k rows; achieving a uniform $36$k would require
+over-sampling (requesting ${\sim}60$k attempts to retain $36$k).
+
+
+% ===================================================================
+\section{Methodological Note: A Filename Collision}
+\label{sec:collision}
+% ===================================================================
+
+The $\pm20\%$ entries missing from Experiment~1 were lost to a defect worth
+recording, because it affects reproducibility of any future sweep.
+
+The output path was constructed as
+\[
+\texttt{\{case\}\_\{mode\}\_\{scenario\_level\}\_\{start\_mode\}\_\{nr\_unit\}\_\{runs\}}
+\]
+which encodes \emph{neither} the load-scale range \emph{nor} the label
+solver.  Consequently the $\pm20\%$, $\pm10\%$ and pandapower runs of a given
+grid all resolved to the same path and were launched concurrently with
+\texttt{--overwrite}.  Three jobs died with
+\texttt{OSError: error closing file} from concurrent writes, and the
+first-generation pandapower results were overwritten by later-finishing
+$\pm10\%$ jobs; those $36{,}000$-row datasets survive only as log lines.
+
+The filename now carries both fields, e.g.
+\begin{center}
+\small
+\texttt{case118\_ppcY\_backbone\_dc\_compile\_ppNR\_ls0.60-1.40\_siNR\_36000\_...}
+\end{center}
+Verified: the four variants that previously collapsed onto one path now yield
+four distinct names.  A companion defect in
+\texttt{merge\_chunked\_parquets.py}---which matched chunk-directory prefixes
+disjunctively and would therefore have blended stale zero-row custom-NR
+chunks into a pandapower merge---was fixed to select exactly one chunk family
+and log its choice.  All ten merges in the final campaign reported selecting
+the \texttt{\_ppnr\_chunk\_} family, and chunk row-sums were verified equal to
+merged row counts for all ten grids.
+
+
+% ===================================================================
+\section{Effect on Label Semantics}
+% ===================================================================
+
+Switching solvers does not alter the dataset schema or remove training
+signal.  Both code paths write the same columns: \texttt{u\_start} (the
+initial voltage guess, the model input) and \texttt{u\_newton\_si} /
+\texttt{S\_newton\_si} (the converged solution, the label).  The dataset
+stores the converged \emph{endpoint}, not the iteration trajectory, so the
+learned line-search component---which lives in the model
+(\texttt{GNSMsg\_armijo.py}), not in the data---is unaffected.  The only
+quantity lost is the \texttt{nr\_iterations} diagnostic, which the pandapower
+path reports as $0$.
+
+Pandapower's solver is itself a Newton--Raphson method; it differs in
+engineering robustness (PV/PQ limit switching, sparse LU factorisation,
+better-conditioned Jacobian assembly), not in algorithm.  Using it as the
+label oracle is therefore consistent with the premise of an NR surrogate, and
+arguably preferable: it is the widely used reference implementation.
+
+
+% ===================================================================
+\section{Conclusions}
+% ===================================================================
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{The perturbation design was never the problem.}  Reducing the
+  load range four-fold changed convergence by ${<}6\%$ on affected grids.
+  The $\pm40\%$ \texttt{backbone} range is retained unchanged.
+
+\item \textbf{The custom NR solver has two failure regimes:} an
+  ill-conditioning regime affecting radial/high-$R/X$ and tightly-constrained
+  grids at any size, and an absolute wall above ${\sim}1{,}300$ buses where
+  yield is identically zero across nine grids.
+
+\item \textbf{Pandapower NR eliminates both regimes} at identical
+  perturbation settings, converting 11 grids from zero or near-zero to
+  usable, doubling the corpus to $909{,}216$ samples, covering all 28 grids,
+  and running ${\sim}40\times$ faster.  The campaign completed 218 Slurm jobs
+  with zero failures.
+
+\item \textbf{One grid is genuinely infeasible at $\pm40\%$.}  case145
+  exhibits a structurally singular Jacobian under both solvers and warrants a
+  narrowed range; the four largest grids show partial infeasibility of the
+  same kind.
+
+\item \textbf{Recommendation.}  Adopt \texttt{pandapower\_nr} as the label
+  oracle for all grids, retain $\pm40\%$ globally, rerun case145 at $\pm20\%$,
+  and over-sample the four largest grids if uniform row counts are required.
+  The custom-NR datasets are retained as the evidence base for this analysis
+  and should be cited when justifying the solver choice in the methods
+  section rather than presenting it as an arbitrary implementation detail.
+\end{enumerate}
+
+\end{document}

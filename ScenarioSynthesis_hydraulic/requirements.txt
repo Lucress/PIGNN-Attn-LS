@@ -1,0 +1,3 @@
+git+https://github.com/idiap/pydhn
+numpy>=1.25,<2
+pyarrow>=12

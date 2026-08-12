@@ -1,0 +1,150 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.65in]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{pdflscape}
+\usepackage{graphicx}
+
+\sisetup{scientific-notation=true, round-mode=places, round-precision=3}
+\newcommand{\pu}{\mathrm{pu}}
+\newcommand{\degc}{^\circ}
+
+\title{GridFM, GridSFM, and LUMINA Experiments on LVN Heo1 and SimBench}
+\author{PIGNN-Attn-LS-PPC experimental summary}
+\date{2 August 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Scope}
+This report summarizes the GridFM, GridSFM, and LUMINA dispatches run through the existing PIGNN-Attn-LS-PPC data loader and evaluation pipeline. Metrics are reported in per-unit on a 100 MVA target base unless noted otherwise. The residual columns are the active and reactive power-balance residuals computed by the current complex128 validation/test metric path.
+
+The LUMINA rows use the released \texttt{argonne/LUMINA-2M} checkpoint (2{,}375{,}548 parameters; 6 heterogeneous-graph-transformer layers, 128 hidden channels, 2 heads, dropout 0.244), adapted to this pipeline in the same way as GridSFM: the parquet loader, split, Newton supervision target, and complex128 residual metrics are unchanged, and only the surrogate is swapped.
+
+\section*{SimBench Dataset Overview}
+The SimBench snapshot-envelope data were generated from 39,268 CGMES snapshots. The grid is much smaller than LVN Heo1: 94 buses and 131 branches. There are 58 loads, with aggregate active-power range 33.09--242.73 MW and aggregate reactive-power range -21.59--70.02 Mvar. Eight loads have zero-width active-power ranges and eight loads have zero-width reactive-power ranges.
+
+The largest varying loads are HV1 Load 56, HV1 Load 58, and HV1 Load 57. Each is approximately in the range
+\[
+P = 2.92\text{--}22.35\ \mathrm{MW}, \qquad
+Q = -0.21\text{--}7.31\ \mathrm{Mvar}.
+\]
+Sampled rows from the merged parquet are populated rather than empty placeholders: \(u_{\rm newton}\) has nonzero voltage entries for all 94 buses, and \(S_{\rm start}\) and \(S_{\rm newton}\) are present.
+
+\section*{SimBench Baseline Metrics}
+Table~\ref{tab:simbench-baseline} reports the raw baseline metrics directly from the SimBench flat-start and DC-init parquets. \(V_{\rm start}\) is the initialization, while \(V_{\rm newton}\) is the saved Newton-Raphson target solution.
+
+\begin{table}[h!]
+\centering
+\caption{SimBench raw-parquet baseline metrics, complex128 residual evaluation.}
+\label{tab:simbench-baseline}
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llrrrrrrrrrr}
+\toprule
+Parquet & State & RMSE & \(|V|\) RMSE & \(\theta\) RMSE [deg] & \(\Delta P_\infty\) & \(\Delta Q_\infty\) & mean \(|\Delta P|\) & mean \(|\Delta Q|\) & p95 \(|\Delta P|\) & p95 \(|\Delta Q|\) \\
+\midrule
+Flat start & \(V_{\rm start}\) & 4.2769e-1 & 3.5898e-2 & 24.418 & 3.9347 & 3.4108 & 3.986e-1 & 1.088e-1 & 1.435 & 3.942e-2 \\
+Flat start & \(V_{\rm newton}\) & 0 & 0 & 0 & 3.039e-12 & 9.731e-13 & 1.147e-13 & 8.243e-14 & 3.812e-13 & 3.723e-13 \\
+DC init & \(V_{\rm start}\) & 5.2491e-2 & 3.5899e-2 & 2.194 & 2.5727 & 4.2274 & 1.113e-1 & 1.957e-1 & 3.452e-1 & 9.333e-1 \\
+DC init & \(V_{\rm newton}\) & 0 & 0 & 0 & 2.985e-13 & 6.193e-13 & 3.496e-14 & 5.965e-14 & 1.474e-13 & 2.554e-13 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\section*{LUMINA Adaptation}
+LUMINA-2M is an ACOPF surrogate that consumes the PGLib-OPF heterogeneous-graph schema, so each block-diagonal PPC batch is converted graph-by-graph into that schema by \texttt{train\_valid\_test\_lumina.py}. Table~\ref{tab:lumina-schema} lists the mapping; it is the same construction used for GridSFM, with one deliberate difference noted below. The adapted graphs pass \texttt{lumina\_inference}'s own \texttt{validate\_hetero\_data} schema check.
+
+\begin{table}[h!]
+\centering
+\caption{PPC branch-row parquet fields mapped onto the LUMINA-2M input schema.}
+\label{tab:lumina-schema}
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+LUMINA tensor & Columns & Source in the PPC parquet \\
+\midrule
+\texttt{bus.x} & 7: base\_kv, vmin, vmax, onehot(PQ, PV, ref, isolated) & \texttt{vn\_kv}, \texttt{-{}-vmin/-{}-vmax}, \texttt{bus\_type} \\
+\texttt{generator.x} & 11: mbase, pg, pmin, pmax, qg, qmin, qmax, vg, $c_2$, $c_1$, $c_0$ & \texttt{S\_start} at ref/PV buses, \texttt{V\_start} \\
+\texttt{load.x} & 2: pd, qd & $-\texttt{S\_start}$ clamped at zero \\
+\texttt{shunt.x} & 2: bs, gs & \texttt{Y\_shunt\_bus} \\
+\texttt{ac\_line.edge\_attr} & 9: angmin, angmax, $b_{\rm fr}$, $b_{\rm to}$, $r$, $x$, rate\_a/b/c & branch series and shunt admittances \\
+\texttt{transformer.edge\_attr} & 11: angmin, angmax, $r$, $x$, rate\_a/b/c, tap, shift, $b_{\rm fr}$, $b_{\rm to}$ & branch rows with $\tau \neq 1$, nonzero shift, or $v_n$ mismatch \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The bus head of the released model emits $[\theta, |V|]$ per bus; the adapter reorders it to the PPC $[|V|, \theta]$ convention and wraps the angle to $(-\pi, \pi]$. LUMINA's sigmoid min/max output scaling maps the magnitude head into $[v_{\min}, v_{\max}] = [0.5, 1.5]$ and is left enabled. The one deviation from the GridSFM adapter is that the known generator injections are written into the \texttt{pg}/\texttt{qg} columns instead of being left at zero, because in the power-flow setting those injections are inputs rather than decision variables; the generator bounds are still set to $P_g \pm \max(0.5|P_g|, 10)$ exactly as in the GridSFM adapter. Note that LUMINA's HGT stack aggregates over edge \emph{types} only, so the branch \texttt{edge\_attr} columns are populated for schema compliance but are not consumed by the released architecture.
+
+\paragraph{The flat/DC distinction is largely invisible to LUMINA.} This is a structural consequence of the released input schema and deserves emphasis when reading the table. The only difference between the flat-start and DC-init parquets is the initialization $V_{\rm start}$, and a direct comparison of the two SimBench parquets shows that this difference lives entirely in the \emph{angle}: $|\theta_{\rm start}|$ reaches 0.715 rad under DC compile and is identically zero under flat start, while $|V_{\rm start}|$ at the generator buses is bit-identical between the two (1.092, 1.092, 1.068). LUMINA's seven bus-feature columns contain no slot for a bus state, so the initialization can only enter through the generator \texttt{vg} feature --- which carries the magnitude, the part that does not differ. The DC information is therefore discarded before the first message-passing layer, and the zero-shot rows for the two starts agree to four significant digits on \emph{both} grids: 8.3645e-1 for either SimBench start, and 6.5070e-1 versus 6.5071e-1 on LVN. The residual differences are sampling noise between two independently drawn scenario sets, not a response to the initialization. This is unlike GridFM, which ingests $V_{\rm start}$ directly as bus features and where DC initialization is decisive, and unlike GridSFM, which computes its own DC prior internally from the predicted $P_g$ and adds the network output as a residual on it. Any future attempt to give LUMINA the benefit of a DC start would have to change the architecture rather than the adapter, because the pretrained weights pin \texttt{input\_channels[bus]} to 7.
+
+\begin{landscape}
+\section*{Model Results}
+\begin{table}[p]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.4pt}
+\caption{GridFM, GridSFM, and LUMINA results across LVN Heo1 and SimBench. ``Final test'' rows are completed test-set evaluations; ``valid/test ep0'' rows are zero-shot evaluations of released weights; ``best valid'' rows are validation snapshots for runs that did not emit a final test block in the available logs. Bold rows/cells mark the strongest current results. All twelve runs of the 2 August 2026 LUMINA dispatch completed their 40 epochs, so every LUMINA training row is a final test evaluation of the best checkpoint.}
+\label{tab:model-results}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llllrrrrrrrrr}
+\toprule
+Grid & Model & Run & Reported row & RMSE & \(|V|\) RMSE & \(\theta\) [deg] & \(\Delta P_\infty\) & \(\Delta Q_\infty\) & mean \(|\Delta P|\) & mean \(|\Delta Q|\) & p95 \(|\Delta P|\) & p95 \(|\Delta Q|\) \\
+\midrule
+LVN & GridFM & HGNS DC & final test & 1.8198e-2 & 1.7952e-2 & 0.1708 & 4.9445e3 & 5.4636e4 & 6.881 & 76.27 & 4.914e-2 & 2.005e-1 \\
+LVN & GridFM & HGNS flat & final test & 2.5644e-2 & 1.9262e-2 & 0.9700 & 1.1691e3 & 7.1869e3 & 1.666 & 10.19 & 1.349e-1 & 1.764e-1 \\
+\textbf{LVN} & \textbf{GridFM} & \textbf{py312 DC pretrain} & \textbf{final test} & \textbf{2.2044e-2} & \textbf{2.1829e-2} & \textbf{0.1761} & \textbf{3.0706} & \textbf{11.023} & \textbf{2.277e-2} & \textbf{8.143e-2} & \textbf{3.853e-2} & \textbf{2.879e-1} \\
+LVN & GridFM & py312 flat FT from DC & final test & 2.4572e-2 & 1.9703e-2 & 0.8413 & 4.0856 & 142.52 & 5.432e-2 & 2.550e-1 & 1.539e-1 & 1.479e-1 \\
+LVN & GridFM & py312 flat scratch & final test & 2.5707e-2 & 2.0160e-2 & 0.9139 & 1.2020e3 & 5.2372e3 & 1.713 & 7.481 & 1.425e-1 & 2.047e-1 \\
+LVN & GridSFM & pretrained eval DC & valid/test ep0 & 7.7078e-2 & 3.6337e-2 & 3.8947 & 4.111e4 & 7.671e4 & 93.50 & 280.7 & 58.14 & 293.1 \\
+LVN & GridSFM & pretrained eval flat & valid/test ep0 & 7.7054e-2 & 3.6346e-2 & 3.8929 & 4.119e4 & 7.670e4 & 93.65 & 280.8 & 58.17 & 292.4 \\
+LVN & GridSFM & pretrained FT DC & best valid ep37 & 6.5422e-2 & 9.6727e-3 & 3.7072 & 4.605 & 0.9792 & 3.274e-2 & 3.589e-2 & 7.626e-2 & 1.623e-1 \\
+LVN & GridSFM & pretrained FT flat & best valid ep32 & 5.2360e-2 & 1.7789e-2 & 2.8216 & 10.33 & 7.744 & 6.609e-2 & 1.468e-1 & 1.185e-1 & 4.255e-1 \\
+LVN & GridSFM & scratch DC & best valid ep25 & 3.5513e-2 & 2.3038e-2 & 1.5485 & 3.907 & 1.887 & 3.629e-2 & 5.760e-2 & 8.070e-2 & 3.251e-1 \\
+\textbf{LVN} & \textbf{GridSFM} & \textbf{scratch flat} & \textbf{best valid ep38} & \textbf{3.6633e-2} & \textbf{2.1337e-2} & \textbf{1.7061} & \textbf{3.418} & \textbf{1.869} & \textbf{3.762e-2} & \textbf{5.268e-2} & \textbf{8.185e-2} & \textbf{2.566e-1} \\
+LVN & LUMINA & pretrained eval flat & valid/test ep0 & 6.5071e-1 & 2.1927e-1 & 35.102 & 5.054e6 & 1.039e6 & 1.142e4 & 4.505e3 & 2.991e3 & 3.451e3 \\
+LVN & LUMINA & pretrained eval DC & valid/test ep0 & 6.5070e-1 & 2.1930e-1 & 35.101 & 5.054e6 & 1.039e6 & 1.142e4 & 4.505e3 & 2.991e3 & 3.450e3 \\
+LVN & LUMINA & pretrained FT flat & final test & 4.1016e-1 & 1.1565e-1 & 22.547 & 5.424e5 & 2.736e6 & 5.082e3 & 8.329e3 & 1.907e3 & 1.783e3 \\
+LVN & LUMINA & pretrained FT DC & final test & 3.5537e-1 & 1.1196e-1 & 19.324 & 4.517e5 & 1.417e7 & 5.004e3 & 2.290e4 & 5.259e3 & 2.190e3 \\
+\textbf{LVN} & \textbf{LUMINA} & \textbf{scratch flat} & \textbf{final test} & \textbf{2.8081e-2} & \textbf{2.3300e-2} & \textbf{0.8980} & \textbf{7.7213} & \textbf{1.5383} & \textbf{4.131e-2} & \textbf{5.401e-2} & \textbf{1.404e-1} & \textbf{2.858e-1} \\
+LVN & LUMINA & scratch DC & final test & 2.8236e-2 & 2.3388e-2 & 0.9064 & 7.7488 & 6.2929 & 4.500e-2 & 1.140e-1 & 1.510e-1 & 3.566e-1 \\
+SimBench & GridFM & flat scratch & final test & 1.7409e-3 & 6.1661e-4 & 0.0933 & 4.9518e-2 & 2.3409e-2 & 8.727e-3 & 4.456e-3 & 2.895e-2 & 1.551e-2 \\
+\textbf{SimBench} & \textbf{GridFM} & \textbf{DC scratch} & \textbf{final test} & \textbf{6.1721e-4} & \textbf{5.0957e-4} & \textbf{0.0200} & \textbf{1.3879e-2} & 3.0698e-2 & \textbf{1.590e-3} & \textbf{4.066e-3} & \textbf{5.485e-3} & \textbf{1.361e-2} \\
+SimBench & GridSFM & pretrained eval flat & valid/test ep0 & 4.5723e-1 & 7.0747e-2 & 25.882 & 62.28 & 74.84 & 5.264 & 4.636 & 31.59 & 21.31 \\
+SimBench & GridSFM & pretrained eval DC & valid/test ep0 & 4.5741e-1 & 7.0715e-2 & 25.893 & 62.87 & 74.59 & 5.270 & 4.618 & 31.50 & 21.22 \\
+SimBench & GridSFM & pretrained FT flat & final test & 2.8693e-1 & 7.6120e-3 & 16.434 & 8.7137 & 7.822e-1 & 6.467e-1 & 1.476e-1 & 2.842 & 4.582e-1 \\
+SimBench & GridSFM & scratch flat & final test & 4.0680e-1 & 7.4520e-3 & 23.304 & 3.795 & 4.9096e-1 & 3.794e-1 & 1.172e-1 & 1.302 & 3.039e-1 \\
+SimBench & GridSFM & pretrained FT DC & best valid ep10 & 4.1436e-1 & 7.5559e-3 & 23.737 & 3.795 & 4.453e-1 & 4.081e-1 & 1.181e-1 & 1.336 & 2.908e-1 \\
+SimBench & GridSFM & scratch DC & best valid ep1 & 4.0592e-1 & 2.5229e-2 & 23.213 & 3.967 & 4.712e-1 & 3.800e-1 & 6.384e-2 & 1.350 & 2.267e-1 \\
+SimBench & LUMINA & pretrained eval flat & valid/test ep0 & 8.3645e-1 & 1.8828e-1 & 46.695 & 18.67 & 10.26 & 3.004 & 1.341 & 12.45 & 5.997 \\
+SimBench & LUMINA & pretrained eval DC & valid/test ep0 & 8.3645e-1 & 1.8827e-1 & 46.695 & 18.67 & 10.27 & 3.003 & 1.341 & 12.45 & 5.997 \\
+SimBench & LUMINA & pretrained FT flat & final test & 1.1353e-1 & 2.4511e-2 & 6.3517 & 5.6137 & 4.8889e-1 & 6.971e-1 & 1.037e-1 & 2.073 & 3.467e-1 \\
+SimBench & LUMINA & pretrained FT DC & final test & 1.1338e-1 & 2.4215e-2 & 6.3461 & 4.1067 & 6.5504e-1 & 6.650e-1 & 1.121e-1 & 1.789 & 2.981e-1 \\
+SimBench & LUMINA & scratch flat & final test & 1.1162e-1 & 2.4073e-2 & 6.2449 & 3.9578 & 7.3900e-1 & 6.624e-1 & 1.126e-1 & 1.854 & 3.050e-1 \\
+\textbf{SimBench} & \textbf{LUMINA} & \textbf{scratch DC} & \textbf{final test} & \textbf{1.1162e-1} & \textbf{2.4069e-2} & \textbf{6.2447} & \textbf{3.9664} & \textbf{6.4723e-1} & \textbf{6.708e-1} & \textbf{1.156e-1} & \textbf{1.838} & \textbf{3.647e-1} \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+\end{landscape}
+
+\section*{Interpretation}
+The strongest SimBench result is now GridFM DC scratch. It reaches a final test voltage RMSE of \(6.17\times10^{-4}\), angle RMSE of \(0.020^\circ\), \(\Delta P_\infty=1.39\times10^{-2}\), and \(\Delta Q_\infty=3.07\times10^{-2}\). GridFM flat scratch is also strong, but the DC-start SimBench run is better on voltage and active-power residuals. Both GridFM SimBench runs are far better than the GridSFM SimBench runs in the available logs.
+
+For LVN Heo1, the cleanest completed GridFM result is the py312 DC-pretrain run: it gives final test \(\Delta P_\infty=3.07\), \(\Delta Q_\infty=11.02\), mean \(|\Delta P|=2.28\times10^{-2}\), and angle RMSE \(0.176^\circ\). The py312 flat scratch run has similar voltage RMSE but much larger infinity residuals, so it is less attractive for congestion-management use.
+
+GridSFM behaves differently. Zero-shot pretrained evaluation is poor on both LVN starts, but fine-tuning or scratch training rapidly reduces residuals. On LVN, the currently best validation residuals are from GridSFM scratch flat/DC and pretrained-FT DC: the infinity residuals are near \(\Delta P_\infty=3\text{--}5\) and \(\Delta Q_\infty=1\text{--}2\), but the angle errors remain much larger than GridFM DC. This suggests GridSFM is learning a physically balanced point, but not necessarily the closest Newton-Raphson operating point.
+
+LUMINA's zero-shot rows are the weakest starting point of the three surrogates: total RMSE 0.65 on LVN and 0.84 on SimBench, with angle errors of $35^\circ$ and $47^\circ$. This is the expected consequence of a task shift rather than a defect of the model. The released weights were fitted to ACOPF, where the generator dispatch and the voltage setpoints are decision variables chosen to minimize cost, whereas here the dispatch is given and the network is asked to reproduce a Newton-Raphson operating point. The comparison is also mildly unfavourable in a second way: LUMINA's sigmoid output scaling maps the magnitude head into $[v_{\min}, v_{\max}] = [0.5, 1.5]$, a range far wider than the $\pm 0.2$ pu band the Newton solutions actually occupy, so an untuned head is poorly calibrated for this target. Training removes most of that gap. On SimBench the completed scratch DC run reaches a final test RMSE of \(1.12\times10^{-1}\) with angle RMSE \(6.24^\circ\) and \(\Delta P_\infty = 3.97\), a factor of 7.5 better than zero-shot and 2.6 times better than the best GridSFM SimBench row, although still two orders of magnitude behind GridFM. On LVN the completed scratch flat run reaches a final test RMSE of \(2.81\times10^{-2}\) with angle RMSE \(0.898^\circ\), better than every GridSFM LVN row on total RMSE and on angle, and closer to GridFM than GridSFM manages, at the cost of a larger active infinity residual (\(\Delta P_\infty = 7.72\) against \(3.4\text{--}3.9\) for GridSFM). The magnitude channel alone tells the opposite story and should not be glossed over: the GridSFM fine-tuned runs reach \(|V|\) RMSE of \(9.67\times10^{-3}\) (pretrained FT DC) and \(1.78\times10^{-2}\) (pretrained FT flat) against \(2.33\times10^{-2}\) for LUMINA scratch flat, so LUMINA's advantage in total RMSE is earned entirely on the angle channel, where GridSFM is three to four times worse.
+
+The sharpest practical finding is that on LVN, fine-tuning from the released ACOPF weights does not merely underperform scratch training --- it diverges. Validation loss falls for the first two or three epochs (0.507 to 0.223 on the DC start), then climbs steadily past its starting value and never recovers: both runs end their 40th epoch far above where they began, at 0.979 for the flat start and 2.009 for the DC start against a zero-shot 0.507. The checkpointed ``best valid'' models are therefore epoch-2 and epoch-11 snapshots, and the final test row of the flat run (RMSE \(4.10\times10^{-1}\)) reflects that early checkpoint rather than 40 epochs of training. The scratch runs on the identical data, optimizer, and learning rate converge smoothly over the same span. The ACOPF weights are therefore not merely a poor initialization for this task on the stiff LVN grid, they are an actively harmful one, and the practical recommendation is to keep the LUMINA architecture and discard the released weights. On SimBench, where the grid is small and better conditioned, fine-tuning is stable and converges to within 2\% of the scratch result.
+
+The SimBench and LVN results should not be interpreted as equally difficult benchmarks. SimBench has 94 buses and 131 branches, while LVN Heo1 is much larger and numerically stiffer. The very strong SimBench GridFM residuals therefore show that the pipeline and architecture can work cleanly on a smaller grid, but they do not automatically imply the same residual scale should be achievable on LVN without further architecture, loss, or data-distribution tuning.
+
+\end{document}

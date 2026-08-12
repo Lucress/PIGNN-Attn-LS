@@ -1,6 +1,7 @@
-# Running GridFM and GridSFM on SimBench, LVN Heo1, and ENTSO-E
+# Running GridFM, GridSFM, and LUMINA on SimBench, LVN Heo1, and ENTSO-E
 
 This guide explains how to reproduce the June 2026 GridFM/GridSFM experiments
+and the August 2026 LUMINA-2M experiments
 with the existing PPC parquet data loader and complex128 residual evaluation.
 It covers SimBench, LVN Heo1, and the 6,051-bus ENTSO-E RealGridTest case,
 and points to the packaged checkpoints
@@ -18,6 +19,7 @@ Only the surrogate model is changed:
 
 - GridFM: `train_valid_test_gridfm.py`
 - GridSFM: `train_valid_test_gridsfm.py`
+- LUMINA: `train_valid_test_lumina.py`
 
 ## 1. Local Repository Layout
 
@@ -32,15 +34,20 @@ Expected important files:
 ```text
 train_valid_test_gridfm.py
 train_valid_test_gridsfm.py
+train_valid_test_lumina.py
 Dataset_optimized_complex_columns.py
 collate_blockdiag_optimized_complex_columns.py
+summarize_model_logs.py
 ```
 
-GridFM/GridSFM dependencies also need their corresponding packages installed:
+GridFM/GridSFM/LUMINA dependencies also need their corresponding packages installed:
 
 ```text
 gridfm_graphkit
 gridsfm
+lumina_inference
+safetensors
+huggingface_hub
 torch
 torch_geometric
 torch_scatter
@@ -48,6 +55,54 @@ numpy
 pandas
 pyarrow
 ```
+
+### Third-party model sources
+
+The three surrogate repositories are cloned as siblings of
+`PIGNN-Attn-LS-PPC`, matching the layout used on Alex. Each keeps its own
+`.git`, so all three are listed in the top-level `.gitignore` and are never
+committed to this repository:
+
+```text
+PIGNN-Attn-LS/LUMINA/           https://github.com/argonne-gridfm/lumina-inference
+PIGNN-Attn-LS/GridSFM/          https://github.com/microsoft/gridSFM
+PIGNN-Attn-LS/gridfm-graphkit/  https://github.com/gridfm/gridfm-graphkit
+```
+
+Revisions used for the August 2026 runs: LUMINA `2201230`, GridSFM `1ca775f`,
+gridfm-graphkit `b3d663b`.
+
+```powershell
+cd ..
+git clone https://github.com/argonne-gridfm/lumina-inference.git LUMINA
+git clone https://github.com/microsoft/gridSFM.git GridSFM
+git clone https://github.com/gridfm/gridfm-graphkit.git gridfm-graphkit
+```
+
+`lumina_inference` is not on PyPI; install it from the local clone. Use
+`--no-deps` so it cannot pull a different torch into an existing environment:
+
+```powershell
+pip install --no-deps -e ..\LUMINA
+pip install --no-deps safetensors
+```
+
+On Alex the same clone lives at
+`/home/hpc/iwi5/iwi5295h/PIGNN-Attn-LS/LUMINA`, installed into the
+`gridfm-py312` environment the same way.
+
+The released LUMINA-2M weights and config come from
+<https://huggingface.co/argonne/LUMINA-2M> and are kept next to the clone, in
+`LUMINA/checkpoints/`, the same way GridSFM keeps `gridsfm_open_v1.1.pt`:
+
+```powershell
+New-Item -ItemType Directory -Force ..\LUMINA\checkpoints | Out-Null
+curl.exe -L https://huggingface.co/argonne/LUMINA-2M/resolve/main/config.json -o ..\LUMINA\checkpoints\lumina_config.json
+curl.exe -L https://huggingface.co/argonne/LUMINA-2M/resolve/main/model.safetensors -o ..\LUMINA\checkpoints\lumina_model.safetensors
+```
+
+`train_valid_test_lumina.py` also downloads both files from the Hub
+automatically when `--model_config` / `--pretrained_checkpoint` are omitted.
 
 On Alex these experiments used:
 
@@ -142,6 +197,22 @@ Available checkpoint groups:
 Note: the LVN GridSFM scratch-DC log is present, but its checkpoint was not in
 the copied-back checkpoint directory at packaging time.
 
+The August 2026 LUMINA dispatch produced two further groups, already copied back
+into this repository:
+
+```text
+results/logs/lumina_lvn_a100_20260802_161906/
+results/logs/lumina_simbench_a40_20260802_161906/
+results/ckpt/lumina_lvn_a100_20260802_161906/
+results/ckpt/lumina_simbench_a40_20260802_161906/
+```
+
+Each group holds six runs: zero-shot pretrained evaluation, pretrained
+fine-tuning, and scratch training, for the flat-start and DC-init parquets.
+The zero-shot runs save no checkpoint (they never train), so each `ckpt` group
+holds the four trained best checkpoints, 9.3 MB each. On Alex the checkpoints
+live under `/home/vault/.../results/ckpt/<group>/`.
+
 ## 4. Result Summary
 
 Metrics are per-unit on a 100 MVA base. Multiply residuals by 100 for MW/MVAr.
@@ -162,6 +233,18 @@ completed test-set evaluations.
 | SimBench | GridSFM | flat scratch | final test | 4.068e-1 | 23.304 | 3.795 | 0.491 | 3.79e-1 | 1.17e-1 | 1.302 | 3.04e-1 |
 | SimBench | GridSFM | DC pre-FT | best valid ep10 | 4.144e-1 | 23.737 | 3.795 | 0.445 | 4.08e-1 | 1.18e-1 | 1.336 | 2.91e-1 |
 | SimBench | GridSFM | DC scratch | best valid ep1 | 4.059e-1 | 23.213 | 3.967 | 0.471 | 3.80e-1 | 6.38e-2 | 1.350 | 2.27e-1 |
+| LVN Heo1 | LUMINA | scratch flat | final test | 2.808e-2 | 0.898 | 7.721 | 1.538 | 4.13e-2 | 5.40e-2 | 1.40e-1 | 2.86e-1 |
+| LVN Heo1 | LUMINA | scratch DC | final test | 2.824e-2 | 0.906 | 7.749 | 6.293 | 4.50e-2 | 1.14e-1 | 1.51e-1 | 3.57e-1 |
+| LVN Heo1 | LUMINA | DC pre-FT (diverging) | final test | 3.554e-1 | 19.324 | 4.517e5 | 1.417e7 | 5.00e3 | 2.29e4 | 5.26e3 | 2.19e3 |
+| LVN Heo1 | LUMINA | flat pre-FT (diverging) | final test | 4.102e-1 | 22.547 | 5.424e5 | 2.736e6 | 5.08e3 | 8.33e3 | 1.91e3 | 1.78e3 |
+| LVN Heo1 | LUMINA | pretrained eval DC | valid/test ep0 | 6.507e-1 | 35.101 | 5.054e6 | 1.039e6 | 1.14e4 | 4.51e3 | 2.99e3 | 3.45e3 |
+| LVN Heo1 | LUMINA | pretrained eval flat | valid/test ep0 | 6.507e-1 | 35.102 | 5.054e6 | 1.039e6 | 1.14e4 | 4.51e3 | 2.99e3 | 3.45e3 |
+| SimBench | LUMINA | scratch DC | final test | 1.116e-1 | 6.245 | 3.966 | 0.647 | 6.71e-1 | 1.16e-1 | 1.838 | 3.65e-1 |
+| SimBench | LUMINA | scratch flat | final test | 1.116e-1 | 6.245 | 3.958 | 0.739 | 6.62e-1 | 1.13e-1 | 1.854 | 3.05e-1 |
+| SimBench | LUMINA | DC pre-FT | final test | 1.134e-1 | 6.346 | 4.107 | 0.655 | 6.65e-1 | 1.12e-1 | 1.789 | 2.98e-1 |
+| SimBench | LUMINA | flat pre-FT | final test | 1.135e-1 | 6.352 | 5.614 | 0.489 | 6.97e-1 | 1.04e-1 | 2.073 | 3.47e-1 |
+| SimBench | LUMINA | pretrained eval flat | valid/test ep0 | 8.365e-1 | 46.695 | 18.67 | 10.26 | 3.00 | 1.34 | 12.45 | 6.00 |
+| SimBench | LUMINA | pretrained eval DC | valid/test ep0 | 8.365e-1 | 46.695 | 18.67 | 10.27 | 3.00 | 1.34 | 12.45 | 6.00 |
 | ENTSO-E | GridFM | flat scratch, 12/40 epochs | best valid ep9 | 4.107e-2 | 2.318 | 17.70 | 15.35 | 3.04e-1 | 1.33e-1 | 1.078 | 3.99e-1 |
 | ENTSO-E | GridFM | DC scratch, 12/40 epochs | best valid ep12 | 1.858e-2 | 1.000 | 12.62 | 12.48 | 2.08e-1 | 1.01e-1 | 7.41e-1 | 2.87e-1 |
 | ENTSO-E | GridFM | flat scratch, best checkpoint | final test | 4.155e-2 | 2.346 | 17.74 | 15.43 | 3.04e-1 | 1.33e-1 | 1.080 | 4.00e-1 |
@@ -175,6 +258,29 @@ Best current takeaways:
   depending whether active or reactive infinity residual is prioritized.
 - GridSFM reduces residuals after training, but its voltage-angle RMSE remains
   much worse than GridFM on both SimBench and LVN Heo1.
+- LUMINA zero-shot is the weakest starting point of the three, which is the
+  expected cost of a task shift from ACOPF to power flow. Its flat and DC rows
+  are identical to four significant digits on both grids, because the released
+  7-column bus schema has no slot for a bus state and the initialization can
+  only enter through the generator `vg` feature, which carries the magnitude
+  rather than the angle that actually differs.
+- Trained LUMINA beats GridSFM on both grids: 1.116e-1 final test RMSE on
+  SimBench against GridSFM's best 2.869e-1, and 2.808e-2 on LVN against
+  GridSFM's best 3.551e-2, with a much better angle in both cases. It stays
+  about two orders of magnitude behind GridFM on SimBench.
+- That advantage is earned on the angle channel only. On the magnitude channel
+  alone the GridSFM LVN fine-tunes are better: |V| RMSE 9.67e-3 (pre-FT DC) and
+  1.78e-2 (pre-FT flat) against 2.33e-2 for LUMINA scratch flat. Compare total
+  RMSE and angle together, never |V| in isolation.
+- On LVN, fine-tuning from the released ACOPF weights **diverges**: validation
+  loss improves for two or three epochs, then climbs past its starting value
+  and never recovers, ending epoch 40 at 0.979 (flat) and 2.009 (DC) against a
+  zero-shot 0.507. Scratch training on the same data, optimizer, and
+  learning rate converges cleanly. Keep the LUMINA architecture, discard the
+  released weights, at least on stiff grids. On SimBench the same fine-tuning
+  is stable and lands within 2% of scratch.
+- All twelve LUMINA runs completed their 40 epochs, so every LUMINA training
+  row above is a final test evaluation of the best checkpoint.
 - The ENTSO-E jobs reached the 24-hour walltime after epoch 12, so they are
   partial training results rather than converged 40-epoch comparisons. DC
   initialization was clearly stronger than flat initialization at that point.
@@ -260,13 +366,108 @@ python -u train_valid_test_gridsfm.py `
   --init_mode scratch
 ```
 
-## 7. Recommended Runs
+## 7. LUMINA Training Commands
+
+LUMINA-2M is a 2,375,548-parameter heterogeneous graph transformer (6 HGT
+layers, 128 hidden channels, 2 heads, dropout 0.244) trained by Argonne on
+PGLib ACOPF cases. `train_valid_test_lumina.py` adapts it exactly the way
+`train_valid_test_gridsfm.py` adapts GridSFM: each PPC branch-row batch is
+converted into LUMINA's PGLib-OPF `HeteroData` schema, and only the bus head is
+used.
+
+| LUMINA tensor | Columns | Filled from the PPC parquet |
+|---|---|---|
+| `bus.x` | 7: `base_kv, vmin, vmax, onehot(PQ, PV, ref, isolated)` | `vn_kv`, `--vmin/--vmax`, `bus_type` |
+| `generator.x` | 11: `mbase, pg, pmin, pmax, qg, qmin, qmax, vg, c2, c1, c0` | `S_start` at ref/PV buses, `V_start` |
+| `load.x` | 2: `pd, qd` | `-S_start` clamped at zero |
+| `shunt.x` | 2: `bs, gs` | `Y_shunt_bus` |
+| `ac_line.edge_attr` | 9: `angmin, angmax, b_fr, b_to, r, x, rate_a, rate_b, rate_c` | branch series/shunt admittances |
+| `transformer.edge_attr` | 11: `angmin, angmax, r, x, rate_a, rate_b, rate_c, tap, shift, b_fr, b_to` | branch rows with `tau != 1`, nonzero shift, or `--treat_voltage_mismatch_as_transformer` |
+
+The bus head emits `[theta, |V|]`; the script reorders it to the PPC `[|V|,
+theta]` convention and wraps the angle to `(-pi, pi]`. LUMINA's min/max output
+scaling maps the magnitude head into `[vmin, vmax]` through a sigmoid, which is
+kept on by default (`--no_minmax_scaling` turns it off). Unlike the GridSFM
+adapter, the known generator injections are written into the `pg`/`qg` columns
+(`--gen_setpoint_mode zero` reproduces the GridSFM behaviour of leaving them at
+zero), because in the power-flow setting those injections are inputs rather
+than unknowns.
+
+Zero-shot evaluation of the released weights (`--EPOCHS 0` runs train/valid/test
+once and exits):
+
+```powershell
+python -u train_valid_test_lumina.py `
+  --PARQUET "C:\data\SimBench_snapshot_envelope_manual_flat_100MVA_coupled_ppcY_manual_flat_siNR_36000_NR_branchrows_directSI.parquet" `
+  --run_name lumina_simbench_pre_eval_flat_b4 `
+  --log_to_file --log_dir ".\results\logs\lumina_simbench_pre_eval_flat" `
+  --ckpt_dir ".\results\ckpt\lumina_simbench_pre_eval_flat" `
+  --model_config "..\LUMINA\checkpoints\lumina_config.json" `
+  --pretrained_checkpoint "..\LUMINA\checkpoints\lumina_model.safetensors" `
+  --PER_UNIT --target_S_base 1e8 --share_grid --lazy_parquet --row_group_cache_size 2 `
+  --dataset_complex_dtype complex128 `
+  --BATCH 4 --EPOCHS 0 `
+  --train_ratio 0.3333 --valid_ratio 0.3333 --seed_value 42 `
+  --treat_voltage_mismatch_as_transformer `
+  --init_mode pretrained
+```
+
+Pretrained fine-tuning:
+
+```powershell
+python -u train_valid_test_lumina.py `
+  --PARQUET "C:\data\SimBench_snapshot_envelope_manual_flat_100MVA_coupled_ppcY_manual_flat_siNR_36000_NR_branchrows_directSI.parquet" `
+  --run_name lumina_simbench_pre_ft_flat_b4 `
+  --log_to_file --log_dir ".\results\logs\lumina_simbench_pre_ft_flat" `
+  --ckpt_dir ".\results\ckpt\lumina_simbench_pre_ft_flat" `
+  --model_config "..\LUMINA\checkpoints\lumina_config.json" `
+  --pretrained_checkpoint "..\LUMINA\checkpoints\lumina_model.safetensors" `
+  --PER_UNIT --target_S_base 1e8 --share_grid --lazy_parquet --row_group_cache_size 2 `
+  --dataset_complex_dtype complex128 `
+  --BATCH 4 --EPOCHS 40 --LR 1e-4 `
+  --train_ratio 0.3333 --valid_ratio 0.3333 --seed_value 42 `
+  --mse_weight 1.0 --physics_weight 1e-2 `
+  --physics_loss_form logcosh --VAL_EVERY 1 `
+  --treat_voltage_mismatch_as_transformer `
+  --init_mode pretrained
+```
+
+Scratch training reuses the released architecture with random weights:
+
+```powershell
+python -u train_valid_test_lumina.py `
+  --PARQUET "C:\data\LVN_snapshot_envelope_manual_flat_coupled_ppcY_manual_flat_siNR_36000_NR_branchrows_directSI.parquet" `
+  --run_name lumina_lvn_scratch_flat_b4 `
+  --log_to_file --log_dir ".\results\logs\lumina_lvn_scratch_flat" `
+  --ckpt_dir ".\results\ckpt\lumina_lvn_scratch_flat" `
+  --model_config "..\LUMINA\checkpoints\lumina_config.json" `
+  --PER_UNIT --target_S_base 1e8 --share_grid --lazy_parquet --row_group_cache_size 2 `
+  --dataset_complex_dtype complex128 `
+  --BATCH 4 --EPOCHS 40 --LR 1e-4 `
+  --train_ratio 0.3333 --valid_ratio 0.3333 --seed_value 42 `
+  --mse_weight 1.0 --physics_weight 1e-2 `
+  --physics_loss_form logcosh --VAL_EVERY 1 `
+  --treat_voltage_mismatch_as_transformer `
+  --init_mode scratch
+```
+
+On Alex the whole 12-job LUMINA matrix (LVN and SimBench, flat and DC start,
+zero-shot/fine-tune/scratch) is submitted with:
+
+```bash
+GRID=both bash dispatch_lumina_simbench_lvn_alex.sh
+```
+
+## 8. Recommended Runs
 
 For SimBench:
 
 1. GridFM DC scratch: best current result.
 2. GridFM flat scratch: strong flat-start baseline.
 3. GridSFM flat scratch/pretrained fine-tune only as comparison baselines.
+4. LUMINA scratch or pretrained fine-tune as a third foundation-model
+   baseline. Run only one start: flat and DC give the same result, so the
+   second start costs a GPU day for a duplicate row.
 
 For LVN Heo1:
 
@@ -274,6 +475,9 @@ For LVN Heo1:
 2. GridFM flat fine-tune from DC: useful warm-start comparison.
 3. GridSFM scratch flat/DC: useful low-residual validation snapshots, but angle
    error remains larger than GridFM.
+4. LUMINA scratch: converges much faster than LUMINA fine-tuned from the
+   released ACOPF weights, which start far from any power-flow solution. Again
+   only one start is informative.
 
 For ENTSO-E RealGridTest:
 
@@ -302,12 +506,27 @@ python -u train_valid_test_gridfm.py `
   --physics_loss_form logcosh --VAL_EVERY 1
 ```
 
-## 8. Notes on Checkpoint Reuse
+## 9. Notes on Checkpoint Reuse
 
 GridFM supports direct checkpoint warm-start through `--init_checkpoint`.
+
+LUMINA supports the same `--init_checkpoint` flag: it is applied on top of the
+selected `--init_mode`, so a run can start from released weights, from a random
+LUMINA-shaped init, or from a checkpoint this script saved earlier.
 
 GridSFM currently trains/evaluates in one run and reloads the best checkpoint at
 the end of that run. The saved GridSFM checkpoints are included for archival and
 future evaluation, but direct checkpoint-only evaluation would need adding an
 `--init_checkpoint` argument to `train_valid_test_gridsfm.py`, similar to the
 GridFM script.
+
+## 10. Rebuilding the Result Tables
+
+`summarize_model_logs.py` parses the training logs of all three surrogates and
+prints the exact columns used in the tables above. It reports the final test
+block when a run completed, and the best-validation epoch otherwise:
+
+```bash
+python summarize_model_logs.py --log-dir "results/logs/lumina_lvn_a100_*" "results/logs/lumina_simbench_a40_*"
+python summarize_model_logs.py --log-dir "results/logs/lumina_*" --format latex
+```

@@ -56,6 +56,78 @@ def _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask):
     return torch.maximum(DP.abs().amax(dim=-1), DQ.abs().amax(dim=-1)).amax()
 
 
+def _per_graph_mismatch_inf_norm(
+    Y, v, th, P_set, Q_set, slack_mask, pv_mask, n_nodes_per_graph=None
+):
+    """Return one masked AC mismatch infinity norm per independent grid."""
+    Vc = v * torch.exp(1j * th)
+    Sc = Vc * ybus_matvec(Y, Vc).conj()
+    DP = (P_set - Sc.real).masked_fill(slack_mask, 0.0)
+    DQ = (Q_set - Sc.imag).masked_fill(slack_mask | pv_mask, 0.0)
+
+    if n_nodes_per_graph is None:
+        return torch.maximum(DP.abs().amax(dim=-1), DQ.abs().amax(dim=-1))
+
+    maxima = []
+    offset = 0
+    for size in n_nodes_per_graph.detach().cpu().tolist():
+        size = int(size)
+        sl = slice(offset, offset + size)
+        maxima.append(torch.maximum(DP[0, sl].abs().amax(), DQ[0, sl].abs().amax()))
+        offset += size
+    return torch.stack(maxima)
+
+
+def _expand_graph_values(values, reference, n_nodes_per_graph=None):
+    """Expand one scalar per grid to the packed node layout."""
+    if n_nodes_per_graph is None:
+        return values.view(-1, 1).expand_as(reference)
+    return torch.repeat_interleave(
+        values, n_nodes_per_graph.to(device=values.device)
+    ).view(1, -1)
+
+
+def _reference_mse_gradient_scale(p_mask, q_mask, n_nodes_per_graph=None):
+    """Derivative scale of the author's masked ``torch.nn.MSELoss``."""
+    if n_nodes_per_graph is None:
+        n_eq = (p_mask.sum(dim=-1) + q_mask.sum(dim=-1)).clamp_min(1)
+        return (2.0 / n_eq).to(dtype=torch.float64).view(-1, 1)
+
+    values = []
+    offset = 0
+    for size in n_nodes_per_graph.detach().cpu().tolist():
+        size = int(size)
+        sl = slice(offset, offset + size)
+        n_eq = (p_mask[0, sl].sum() + q_mask[0, sl].sum()).clamp_min(1)
+        values.append((2.0 / n_eq).expand(size))
+        offset += size
+    return torch.cat(values).view(1, -1).to(dtype=torch.float64)
+
+
+def _normalize_per_graph(grad_vm, grad_va, n_nodes_per_graph=None):
+    """Normalize gradient features independently for each packed grid."""
+    if n_nodes_per_graph is None:
+        scale = torch.maximum(
+            grad_vm.abs().amax(dim=-1, keepdim=True),
+            grad_va.abs().amax(dim=-1, keepdim=True),
+        ).clamp_min(1e-12)
+        return grad_vm / scale, grad_va / scale
+
+    vm_parts = []
+    va_parts = []
+    offset = 0
+    for size in n_nodes_per_graph.detach().cpu().tolist():
+        size = int(size)
+        sl = slice(offset, offset + size)
+        scale = torch.maximum(
+            grad_vm[0, sl].abs().amax(), grad_va[0, sl].abs().amax()
+        ).clamp_min(1e-12)
+        vm_parts.append(grad_vm[:, sl] / scale)
+        va_parts.append(grad_va[:, sl] / scale)
+        offset += size
+    return torch.cat(vm_parts, dim=1), torch.cat(va_parts, dim=1)
+
+
 def _build_dense_Y_from_branchrows_single(
     N: int,
     Branch_f_bus: torch.Tensor,
@@ -286,9 +358,13 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         physics_huber_delta: float = 1.0,
         physics_final_weight: float = 0.0,
         solver_update_mode: str = "direct",
-        preconditioner_vm_step: float = 0.02,
-        preconditioner_va_step: float = 0.05,
+        preconditioner_vm_step: float = 0.003377,
+        preconditioner_va_step: float = 0.003377,
         preconditioner_log_clip: float = 5.0,
+        preconditioner_optimizer: str = "author_adam",
+        preconditioner_beta1: float = 0.979681,
+        preconditioner_beta2: float = 0.963442,
+        preconditioner_eps: float = 1e-8,
     ):
         super().__init__()
         self.K = K
@@ -319,10 +395,22 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
             raise ValueError("Preconditioner initial step scales must be positive.")
         if preconditioner_log_clip <= 0.0:
             raise ValueError("preconditioner_log_clip must be positive.")
+        if preconditioner_optimizer not in ("author_adam", "gd"):
+            raise ValueError("preconditioner_optimizer must be 'author_adam' or 'gd'.")
+        if not 0.0 <= preconditioner_beta1 < 1.0:
+            raise ValueError("preconditioner_beta1 must lie in [0, 1).")
+        if not 0.0 <= preconditioner_beta2 < 1.0:
+            raise ValueError("preconditioner_beta2 must lie in [0, 1).")
+        if preconditioner_eps <= 0.0:
+            raise ValueError("preconditioner_eps must be positive.")
         self.solver_update_mode = solver_update_mode
         self.preconditioner_vm_step = preconditioner_vm_step
         self.preconditioner_va_step = preconditioner_va_step
         self.preconditioner_log_clip = preconditioner_log_clip
+        self.preconditioner_optimizer = preconditioner_optimizer
+        self.preconditioner_beta1 = preconditioner_beta1
+        self.preconditioner_beta2 = preconditioner_beta2
+        self.preconditioner_eps = preconditioner_eps
 
         self.d_model = d_model if d_model is not None else d_hi
         self.n_heads = n_heads
@@ -540,6 +628,10 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         q_mask = ~(slack_mask | pv_mask)
 
         phys_terms = []
+        dpf_m_vm = torch.zeros_like(v)
+        dpf_m_va = torch.zeros_like(th)
+        dpf_v_vm = torch.zeros_like(v)
+        dpf_v_va = torch.zeros_like(th)
 
         # ------------------------- K iterations -------------------------
         for k in range(self.K):
@@ -552,26 +644,49 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
 
             grad_vm = None
             grad_va = None
+            dpf_direction_vm = None
+            dpf_direction_va = None
             if self.solver_update_mode == "physics_preconditioner":
-                # Gradient of 0.5 * sum(F_P^2 + F_Q^2).  Using the sum form
-                # avoids making the physical direction shrink with bus count;
-                # the subsequent positive normalization is one scalar per
-                # batch item and therefore preserves the descent direction.
+                # Exact gradient of the author's masked torch.nn.MSELoss:
+                # P at PV/PQ buses and Q at PQ buses. Each block-diagonal grid
+                # is scaled independently so batching cannot couple its solve.
                 rP = (-DP).to(Vc.dtype)
                 rQ = (-DQ).to(Vc.dtype)
-                w = rP + 1j * rQ
+                mse_scale = _reference_mse_gradient_scale(
+                    p_mask, q_mask, n_nodes_per_graph
+                ).to(device=v.device, dtype=v.dtype)
+                w = rP * mse_scale + 1j * (rQ * mse_scale)
                 g_complex = w * Ic + adjoint_ybus_matvec(Y, w.conj() * Vc)
                 phase = torch.exp(1j * th.to(Vc.dtype))
                 grad_vm = (g_complex.conj() * phase).real.to(v.dtype)
                 grad_va = (g_complex.conj() * (1j * Vc)).real.to(th.dtype)
                 grad_vm = grad_vm.masked_fill(slack_mask | pv_mask, 0.0)
                 grad_va = grad_va.masked_fill(slack_mask, 0.0)
-                grad_norm = torch.maximum(
-                    grad_vm.abs().amax(dim=-1, keepdim=True),
-                    grad_va.abs().amax(dim=-1, keepdim=True),
-                ).clamp_min(1e-12)
-                grad_vm = grad_vm / grad_norm
-                grad_va = grad_va / grad_norm
+
+                if self.preconditioner_optimizer == "author_adam":
+                    beta1 = self.preconditioner_beta1
+                    beta2 = self.preconditioner_beta2
+                    dpf_m_vm = beta1 * dpf_m_vm + (1.0 - beta1) * grad_vm
+                    dpf_m_va = beta1 * dpf_m_va + (1.0 - beta1) * grad_va
+                    dpf_v_vm = beta2 * dpf_v_vm + (1.0 - beta2) * grad_vm.square()
+                    dpf_v_va = beta2 * dpf_v_va + (1.0 - beta2) * grad_va.square()
+                    bias1 = 1.0 - beta1 ** (k + 1)
+                    bias2 = 1.0 - beta2 ** (k + 1)
+                    dpf_direction_vm = (dpf_m_vm / bias1) / (
+                        torch.sqrt(dpf_v_vm / bias2) + self.preconditioner_eps
+                    )
+                    dpf_direction_va = (dpf_m_va / bias1) / (
+                        torch.sqrt(dpf_v_va / bias2) + self.preconditioner_eps
+                    )
+                else:
+                    dpf_direction_vm = grad_vm
+                    dpf_direction_va = grad_va
+
+                # Only the neural features are normalized; the actual update
+                # below remains the reference optimizer direction.
+                grad_vm, grad_va = _normalize_per_graph(
+                    grad_vm, grad_va, n_nodes_per_graph
+                )
 
             bus_parts = [v, th, DP, DQ]
             if grad_vm is not None:
@@ -613,10 +728,11 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                 v_scale = self.preconditioner_vm_step * torch.exp(
                     torch.clamp(v_raw, -clip, clip)
                 )
-                # Positive diagonal graph preconditioner. Before projection,
-                # g^T d = -sum(scale * g^2) <= 0 by construction.
-                dth = -theta_scale * grad_va
-                dv = -v_scale * grad_vm
+                # PIGNN learns positive coordinate-wise multipliers around the
+                # author's DPF optimizer direction. The residual safeguard
+                # below accepts or rejects this proposal independently per grid.
+                dth = -theta_scale * dpf_direction_va
+                dv = -v_scale * dpf_direction_vm
             else:
                 dth = theta_raw
                 dv = v_raw
@@ -633,6 +749,62 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
 
             if self.use_armijo:
                 v_min, v_max = 0.75, 1.20
+
+                if self.solver_update_mode == "physics_preconditioner":
+                    with torch.no_grad():
+                        F0_graph = _per_graph_mismatch_inf_norm(
+                            Y, v, th, P_set, Q_set, slack_mask, pv_mask,
+                            n_nodes_per_graph,
+                        )
+
+                    max_backtracks = max(1, int(self.armijo_max_backtracks))
+                    rho = min(max(float(self.armijo_rho), 1e-12), 1.0 - 1e-12)
+                    c1 = float(self.armijo_c1)
+                    min_alpha = max(0.0, float(self.armijo_min_alpha))
+                    alpha_values = []
+                    a_tmp = 1.0
+                    for _ in range(max_backtracks):
+                        alpha_values.append(a_tmp)
+                        a_tmp *= rho
+                        if min_alpha > 0.0 and a_tmp < min_alpha:
+                            break
+
+                    selected = F0_graph.new_zeros(F0_graph.shape)
+                    accepted = torch.zeros_like(F0_graph, dtype=torch.bool)
+                    for a in alpha_values:
+                        v_try = torch.clamp(v + a * dv, v_min, v_max)
+                        th_try = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
+                        with torch.no_grad():
+                            F_try_graph = _per_graph_mismatch_inf_norm(
+                                Y, v_try, th_try, P_set, Q_set,
+                                slack_mask, pv_mask, n_nodes_per_graph,
+                            )
+                            ok = F_try_graph <= (1.0 - c1 * a) * F0_graph
+                            take = (~accepted) & ok
+                            selected = torch.where(
+                                take, selected.new_full(selected.shape, a), selected
+                            )
+                            accepted = accepted | take
+
+                    if self.armijo_mode == "geometric_safe":
+                        selected = torch.where(
+                            accepted, selected, selected.new_full(selected.shape, min_alpha)
+                        )
+                    # For the integrated solver, fixed/geometric/reject all
+                    # reject a grid if no candidate decreases its physical
+                    # residual. This is the inference-time safety property.
+                    alpha_node = _expand_graph_values(
+                        selected, v, n_nodes_per_graph
+                    )
+                    v = torch.clamp(v + alpha_node * dv, v_min, v_max)
+                    th = (th + alpha_node * dth + math.pi) % (2 * math.pi) - math.pi
+                    m = m + alpha_node.unsqueeze(-1) * dm
+                    if self.pinn:
+                        term = (self.gamma ** (self.K - 1 - k)) * self._physics_residual_loss(
+                            DP, DQ, P_set, Q_set, p_mask, q_mask, n_nodes_per_graph
+                        )
+                        phys_terms.append(term)
+                    continue
 
                 with torch.no_grad():
                     F0 = _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask)

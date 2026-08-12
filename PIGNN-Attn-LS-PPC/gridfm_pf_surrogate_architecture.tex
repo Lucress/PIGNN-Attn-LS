@@ -1,0 +1,200 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\setlist{nosep}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ind}{\mathbb{1}}
+\newcommand{\wrap}{\operatorname{wrap}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\LN}{\operatorname{LN}}
+\title{GridFM/HGNS-Style Power-Flow Surrogate Adapter\\\large Architecture, Inputs, Losses, and Metrics}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+
+\noindent\textbf{Scope.} The PF model in \texttt{train\_valid\_test\_gridfm.py} is \emph{not} the complete native GridFM OPF model. It is a GridFM/HGNS-style PF surrogate adapter:
+\[
+\boxed{(S^{\rm set},V^0,\text{bus types},\text{branches})\longrightarrow(\hat v,\hat\theta).}
+\]
+The OPF-related fields visible in the script are inactive under \texttt{--task pf}, the default mode.
+
+\section{PF problem definition}
+For each scenario, the inputs are
+\begin{align*}
+S_i^{\rm set}&=P_i^{\rm set}+jQ_i^{\rm set}, &
+V_i^0&=(v_i^0,\theta_i^0),\\
+t_i&\in\{\mathrm{REF},\mathrm{PV},\mathrm{PQ}\}, &
+\mathcal B&=\text{branch and transformer data}.
+\end{align*}
+The supervised target is the Newton--Raphson solution, $V_i^{\rm NR}=(v_i^{\rm NR},\theta_i^{\rm NR})$, while the model predicts $\hat V_i=(\hat v_i,\hat\theta_i)$. Unlike PIGNN, it is a direct map,
+\[
+\hat V=f_\Theta(S^{\rm set},V^0,\mathcal G),
+\]
+not an unrolled sequence $V^{(0)},\ldots,V^{(K)}$.
+
+\section{Block-diagonal batching}
+For a minibatch of $B$ independent cases, the collator forms a disconnected graph,
+\[
+\mathcal G_{\rm batch}=\mathcal G_1\sqcup\mathcal G_2\sqcup\cdots\sqcup\mathcal G_B.
+\]
+If case $b$ has $N_b$ buses, the model receives $N_{\rm batch}=\sum_{b=1}^B N_b$ bus nodes, with no edges between cases.
+
+\section{Bus-node inputs}
+Every electrical bus becomes one bus node with a 15-dimensional feature vector:
+\[
+x_i^{\rm bus}=\begin{bmatrix}
+\widetilde P_{D,i}\\\widetilde Q_{D,i}\\Q_{G,i}^{\rm feature}\\v_i^0\\\theta_i^0\\
+\ind_{i\in\mathrm{PQ}}\\\ind_{i\in\mathrm{PV}}\\\ind_{i\in\mathrm{REF}}\\
+v_i^{\min}\\v_i^{\max}\\Q_{G,i}^{\min}\\Q_{G,i}^{\max}\\
+\widetilde G_i^{\rm sh}\\\widetilde B_i^{\rm sh}\\\nu_i
+\end{bmatrix}\in\R^{15}.
+\]
+In PF mode,
+\[
+\widetilde P_{D,i}=T(-P_i^{\rm set}),\qquad \widetilde Q_{D,i}=T(-Q_i^{\rm set}),\qquad
+T(x)=\operatorname{sign}(x)\log(1+|x|).
+\]
+The minus sign changes the net-injection convention into demand-like channels. The other PF values are
+\[
+Q_{G,i}^{\rm feature}=0,\quad v_i^{\min}=0.5,\quad v_i^{\max}=1.5,\quad
+Q_{G,i}^{\min}=-10,\quad Q_{G,i}^{\max}=10.
+\]
+The voltage and reactive limits are placeholders; they do not impose generator limits. Bus shunts and nominal-voltage encoding are
+\[
+\widetilde G_i^{\rm sh}=T(\Re Y_i^{\rm sh}),\qquad \widetilde B_i^{\rm sh}=T(\Im Y_i^{\rm sh}),\qquad
+\nu_i=\log_{10}(V_{i,\rm nom}^{\rm kV}+10^{-9}).
+\]
+
+\section{Proxy generator inputs}
+The adapter creates one proxy generator for every PV or slack bus:
+\[
+\mathcal V_{\rm gen}=\{g_i:i\in\mathcal V_{\rm PV}\cup\mathcal V_{\rm REF}\}.
+\]
+Its seven-dimensional input is
+\[
+x_g^{\rm gen}=\begin{bmatrix}\widetilde P_g\\P_g^{\min}\\P_g^{\max}\\c_{0,g}\\c_{1,g}\\c_{2,g}\\z_g\end{bmatrix}\in\R^7,
+\qquad \widetilde P_g=T\!\left(\max(P_{b(g)}^{\rm set},0)\right),
+\]
+with $P_g^{\min}=-10$, $P_g^{\max}=10$, $c_{0,g}=c_{1,g}=c_{2,g}=0$, and $z_g=1$. Thus this node is an aggregate proxy associated with a PV/slack bus, not a reconstructed physical generator.
+
+\section{Transformer-aware bus edges}
+For branch $e=(f,t)$, set $a_e=\tau_e e^{j\varphi_e}$. The directed admittance terms are
+\begin{align*}
+Y_{ff,e}&=\frac{y_{f,e}+y_{f,e}^{\rm sh}/2}{a_ea_e^*}, &
+Y_{tt,e}&=y_{t,e}+y_{t,e}^{\rm sh}/2,\\
+Y_{ft,e}&=-\frac{y_{ft,e}}{a_e^*}, &
+Y_{tf,e}&=-\frac{y_{tf,e}}{a_e}.
+\end{align*}
+Each physical branch makes the two directed graph edges $f\to t$ and $t\to f$, with
+\[
+e_{f\to t}=\begin{bmatrix}0\\0\\T(\Re Y_{ff})\\T(\Im Y_{ff})\\T(\Re Y_{ft})\\T(\Im Y_{ft})\\\tau\\-\pi\\\pi\\0\end{bmatrix},\qquad
+e_{t\to f}=\begin{bmatrix}0\\0\\T(\Re Y_{tt})\\T(\Im Y_{tt})\\T(\Re Y_{tf})\\T(\Im Y_{tf})\\\tau\\-\pi\\\pi\\0\end{bmatrix}.
+\]
+The phase shift $\varphi$ is not a separate feature, but is encoded in $Y_{ft}$ and $Y_{tf}$.
+
+\section{Heterogeneous graph and input projections}
+The graph is $\mathcal G=(\mathcal V_{\rm bus},\mathcal V_{\rm gen},\mathcal E_{bb},\mathcal E_{gb},\mathcal E_{bg})$, where $\mathcal E_{bb}$ denotes physical bus-to-bus branches, and $\mathcal E_{gb}$ and $\mathcal E_{bg}$ are proxy-generator association edges. Only $\mathcal E_{bb}$ has edge features.
+
+The feature types are independently embedded:
+\[
+h_i^{\rm bus,(0)}=f_{\rm bus}(x_i^{\rm bus}),\qquad h_g^{\rm gen,(0)}=f_{\rm gen}(x_g^{\rm gen}),\qquad \tilde e_{ij}=f_{\rm edge}(e_{ij}),
+\]
+where
+\[
+f(x)=\LN\!\left(W_2\,\operatorname{LeakyReLU}(W_1x+b_1)+b_2\right).
+\]
+For experimental embedding size $d=48$, all three embeddings lie in $\R^{48}$.
+
+\section{Relation-specific Transformer attention}
+At layer $\ell$, each relation uses its own \texttt{TransformerConv} parameters, $\mathcal T_{bb}^{(\ell)}$, $\mathcal T_{gb}^{(\ell)}$, and $\mathcal T_{bg}^{(\ell)}$. For bus-to-bus attention and head $h$,
+\begin{align*}
+q_i^{(\ell,h)}&=W_{Q,bb}^{(\ell,h)}h_i^{\rm bus,(\ell)},\\
+k_{j,ij}^{(\ell,h)}&=W_{K,bb}^{(\ell,h)}h_j^{\rm bus,(\ell)}+W_{E,bb}^{(\ell,h)}\tilde e_{ji},\\
+z_{j,ij}^{(\ell,h)}&=W_{V,bb}^{(\ell,h)}h_j^{\rm bus,(\ell)}+W_{E,bb}^{(\ell,h)}\tilde e_{ji},\\
+\alpha_{ij,bb}^{(\ell,h)}&=\operatorname{softmax}_{j\in\mathcal N(i)}\!\left(\frac{q_i^{(\ell,h)\top}k_{j,ij}^{(\ell,h)}}{\sqrt{d_h}}\right),\\
+m_{i,bb}^{(\ell,h)}&=\sum_{j\in\mathcal N(i)}\alpha_{ij,bb}^{(\ell,h)}z_{j,ij}^{(\ell,h)}.
+\end{align*}
+Hence the model does not use an explicit scalar bias $q_i^\top k_j+f_{\rm edge}(e_{ij})$: PyG \texttt{TransformerConv} adds the edge embedding to key and value transformations. The association messages are
+\[
+m_{i,gb}^{(\ell)}=\mathcal T_{gb}^{(\ell)}\!\left(h_i^{\rm bus,(\ell)},\{h_g^{\rm gen,(\ell)}:b(g)=i\}\right),\qquad
+m_{g,bg}^{(\ell)}=\mathcal T_{bg}^{(\ell)}\!\left(h_g^{\rm gen,(\ell)},h_{b(g)}^{\rm bus,(\ell)}\right),
+\]
+and have no edge attributes.
+
+\section{Aggregation and depth}
+Bus messages sum across relations while a generator receives only its associated bus message:
+\[
+m_i^{\rm bus,(\ell)}=m_{i,bb}^{(\ell)}+m_{i,gb}^{(\ell)},\qquad m_g^{\rm gen,(\ell)}=m_{g,bg}^{(\ell)}.
+\]
+After each heterogeneous layer,
+\[
+u_i^{\rm bus,(\ell)}=\operatorname{LeakyReLU}(\LN(m_i^{\rm bus,(\ell)})),\qquad
+u_g^{\rm gen,(\ell)}=\operatorname{LeakyReLU}(\LN(m_g^{\rm gen,(\ell)})).
+\]
+For either node type, the outer update is $h^{(\ell+1)}=h^{(\ell)}+u^{(\ell)}$ when dimensions match, and $h^{(\ell+1)}=u^{(\ell)}$ otherwise. The first layer maps $48\to48H$; with $H=8$, this is $48\to384$, so only subsequent layers use residual updates in $\R^{384}$. The experiments use $L=12$, $H=8$, and $d=48$: twelve representational message-passing layers, not twelve PF iterations.
+
+\section{Voltage output head}
+Only the final bus embedding is decoded:
+\[
+[\delta v_i,\delta\theta_i]=f_{\rm out}(h_i^{\rm bus,(L)}),\qquad f_{\rm out}:\R^{384}\to\R^{48}\to\R^2.
+\]
+The prediction is a residual correction:
+\[
+\boxed{\hat v_i=\clip(v_i^0+\delta v_i,v_{\min},v_{\max})},\qquad
+\boxed{\hat\theta_i=\wrap(\theta_i^0+\delta\theta_i)}.
+\]
+Normally $v_{\min}=0.5$ and $v_{\max}=1.5$. No PF operational output mask is used: slack angles and PV magnitudes can receive learned corrections; no intermediate mismatch, nor Armijo line search, is performed.
+
+\section{Supervised PF and final-state physics losses}
+Define the voltage and wrapped-angle errors by
+\[
+d_i^v=\hat v_i-v_i^{\rm NR},\qquad d_i^\theta=\operatorname{atan2}\!\left(\sin(\hat\theta_i-\theta_i^{\rm NR}),\cos(\hat\theta_i-\theta_i^{\rm NR})\right).
+\]
+The supervised loss is
+\[
+\mathcal L_{\rm MSE}=\frac1N\sum_{i=1}^N\left[(d_i^v)^2+(d_i^\theta)^2\right].
+\]
+For physics, form $\hat{\underline V}_i=\hat v_i e^{j\hat\theta_i}$, $\hat{\underline I}=Y_{\rm bus}\hat{\underline V}$, and $\hat{\underline S}=\hat{\underline V}\odot\hat{\underline I}^{*}$. Then
+\[
+\Delta P_i=P_i^{\rm set}-\Re\hat{\underline S}_i,\qquad \Delta Q_i=Q_i^{\rm set}-\Im\hat{\underline S}_i.
+\]
+The $\Delta P$ equations are used at every non-reference bus, and the $\Delta Q$ equations at PQ buses only. With
+\[
+r=[\{\Delta P_i:i\notin\mathcal V_{\rm REF}\},\{\Delta Q_i:i\in\mathcal V_{\rm PQ}\}],
+\]
+the default \texttt{logcosh} physics loss is
+\[
+\mathcal L_{\rm phys}=\frac1{|r|}\sum_q\log\cosh\!\left(\clip(r_q,-30,30)\right),\qquad
+\boxed{\mathcal L_{\rm PF}=w_{\rm MSE}\mathcal L_{\rm MSE}+w_{\rm phys}\mathcal L_{\rm phys}}.
+\]
+Experimental defaults are $w_{\rm MSE}=1$ and $w_{\rm phys}=0.01$. The training physics calculation uses float32/complex64; validation and test residual metrics can use the dataloader's complex128 $Y_{\rm bus}$.
+
+\section{Outputs and reported metrics}
+The only PF output is $\boxed{\hat V\in\R^{N\times2}=[\hat v,\hat\theta]}$. The model does not output $\hat P_G$, $\hat Q_G$, cost, or dispatch. Reported voltage errors are
+\[
+\operatorname{RMSE}_v=\sqrt{\frac1N\sum_i(\hat v_i-v_i^{\rm NR})^2},\qquad
+\operatorname{RMSE}_\theta=\sqrt{\frac1N\sum_i\wrap(\hat\theta_i-\theta_i^{\rm NR})^2}.
+\]
+Per-case physical residuals are
+\[
+\Delta P_\infty=\max_{i\notin\mathrm{REF}}|\Delta P_i|,\qquad \Delta Q_\infty=\max_{i\in\mathrm{PQ}}|\Delta Q_i|.
+\]
+Logged \texttt{dPinf} and \texttt{dQinf} are dataset averages of these per-case infinity norms; mean, p95, and RMSE residuals aggregate all valid bus equations.
+
+\section{Architecture summary}
+\[
+\boxed{\begin{aligned}
+&(S^{\rm set},V^0,\text{bus type},\text{shunts},\text{branches},V_{\rm nom})\\
+&\quad\xrightarrow{\text{bus/gen/edge projections}}
+\xrightarrow{12\text{ heterogeneous Transformer layers}}
+\xrightarrow{\text{bus voltage correction head}}(\hat v,\hat\theta).
+\end{aligned}}
+\]
+Generator limits, costs, and OPF machinery are not part of this PF mapping; in PF mode they are placeholders or unused compatibility fields.
+\end{document}

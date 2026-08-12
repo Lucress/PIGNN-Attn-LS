@@ -612,6 +612,199 @@ def _build_dc_compile_start(
 # Generic generator: one metadata row per PPC branch row
 # ============================================================
 
+def _empty_decision_space(N: int):
+    """Placeholder decision space used when the OPF does not converge."""
+    nan = lambda: np.full(N, np.nan, dtype=np.float64)  # noqa: E731
+    return (
+        nan(), nan(),                      # p_disp_bus, q_disp_bus
+        nan(), nan(), nan(), nan(),        # p_min/p_max/q_min/q_max
+        np.zeros(N, dtype=np.float64),     # cost_c2
+        np.zeros(N, dtype=np.float64),     # cost_c1
+        np.zeros(N, dtype=np.float64),     # cost_c0
+        np.zeros(N, dtype=np.int8),        # is_controllable
+    )
+
+
+def _bus_decision_space(net, N: int):
+    """Aggregate the OPF decision space onto buses, in PPC bus order.
+
+    Covers BOTH net.gen and net.ext_grid: the slack is a dispatchable unit with
+    its own cost row and its own limits, and omitting it leaves a large hole in
+    the dispatch (case14's slack carries ~194 MW). Several units may sit on one
+    bus, so powers and limits are summed per bus and costs are taken from the
+    unit with the largest capacity on that bus.
+
+    Bus alignment follows the same assumption as the caller: res_* frames are in
+    pandapower bus order, which coincides with the PPC order when the sizes
+    agree. Returns all-NaN limits for buses with no dispatchable unit.
+    """
+    p_disp = np.zeros(N, dtype=np.float64)
+    q_disp = np.zeros(N, dtype=np.float64)
+    p_min = np.full(N, np.nan, dtype=np.float64)
+    p_max = np.full(N, np.nan, dtype=np.float64)
+    q_min = np.full(N, np.nan, dtype=np.float64)
+    q_max = np.full(N, np.nan, dtype=np.float64)
+    c2 = np.zeros(N, dtype=np.float64)
+    c1 = np.zeros(N, dtype=np.float64)
+    c0 = np.zeros(N, dtype=np.float64)
+    ctrl = np.zeros(N, dtype=np.int8)
+    cap_seen = np.zeros(N, dtype=np.float64)
+
+    bus_index = net.bus.index
+    poly = getattr(net, "poly_cost", None)
+
+    for et, res_name in (("gen", "res_gen"), ("ext_grid", "res_ext_grid")):
+        frame = getattr(net, et, None)
+        res = getattr(net, res_name, None)
+        if frame is None or not len(frame) or res is None or len(res) != len(frame):
+            continue
+
+        pos = bus_index.get_indexer(frame["bus"].to_numpy())
+        for k in range(len(frame)):
+            i = int(pos[k])
+            if i < 0 or i >= N:
+                # Bus not in the PPC slice (out of service / different order).
+                continue
+            ctrl[i] = 1
+            p_disp[i] += float(res["p_mw"].iloc[k])
+            if "q_mvar" in res.columns:
+                q_disp[i] += float(res["q_mvar"].iloc[k])
+
+            for col, arr in (("min_p_mw", p_min), ("max_p_mw", p_max),
+                             ("min_q_mvar", q_min), ("max_q_mvar", q_max)):
+                if col in frame.columns:
+                    val = float(frame[col].iloc[k])
+                    arr[i] = val if np.isnan(arr[i]) else arr[i] + val
+
+            # Cost curve of the largest unit on the bus.
+            if poly is not None and len(poly):
+                cap = abs(float(frame["max_p_mw"].iloc[k])) if "max_p_mw" in frame.columns else 0.0
+                if cap >= cap_seen[i]:
+                    row = poly[(poly["et"] == et) & (poly["element"] == frame.index[k])]
+                    if len(row):
+                        cap_seen[i] = cap
+                        c2[i] = float(row["cp2_eur_per_mw2"].iloc[0])
+                        c1[i] = float(row["cp1_eur_per_mw"].iloc[0])
+                        c0[i] = float(row["cp0_eur"].iloc[0])
+
+    return p_disp, q_disp, p_min, p_max, q_min, q_max, c2, c1, c0, ctrl
+
+
+def _solve_opf(
+    net,
+    *,
+    N: int,
+    Vbase,
+    Y_matrix,
+    vm_limits=None,
+    line_max_loading=None,
+    use_dc: bool = False,
+):
+    """Solve the OPF for an already-perturbed net and extract labels.
+
+    Returns a tuple appended to the standard case_generation_pandapower result:
+        (u_opf_si, S_opf_si, lam_p, lam_q, gen_p_opt, gen_q_opt,
+         opf_cost, opf_converged)
+
+    Bus voltage limits and branch loading limits are applied here rather than
+    baked into the case, because several PPC benchmarks (case300 in particular)
+    ship with limits that make the base case OPF-infeasible.
+    """
+    # This module imports pandapower function-locally throughout, never at
+    # module scope; keep that convention here.
+    import pandapower as pp
+    from pandapower.optimal_powerflow import OPFNotConverged
+
+    u_opf_si = np.zeros(N, dtype=np.complex128)
+    S_opf_si = np.zeros(N, dtype=np.complex128)
+    (
+        p_disp_bus, q_disp_bus,
+        p_min_bus, p_max_bus, q_min_bus, q_max_bus,
+        cost_c2, cost_c1, cost_c0, is_controllable,
+    ) = _empty_decision_space(N)
+    lam_p = np.full(N, np.nan, dtype=np.float64)
+    lam_q = np.full(N, np.nan, dtype=np.float64)
+    n_gen = int(len(net.gen)) if hasattr(net, "gen") else 0
+    gen_p_opt = np.full(n_gen, np.nan, dtype=np.float64)
+    gen_q_opt = np.full(n_gen, np.nan, dtype=np.float64)
+    opf_cost = float("nan")
+    opf_converged = False
+
+    if vm_limits is not None:
+        lo, hi = float(vm_limits[0]), float(vm_limits[1])
+        net.bus["min_vm_pu"] = lo
+        net.bus["max_vm_pu"] = hi
+
+    if line_max_loading is not None:
+        lim = float(line_max_loading)
+        if hasattr(net, "line") and len(net.line):
+            net.line["max_loading_percent"] = lim
+        if hasattr(net, "trafo") and len(net.trafo):
+            net.trafo["max_loading_percent"] = lim
+
+    try:
+        if use_dc:
+            pp.rundcopp(net)
+        else:
+            pp.runopp(net, calculate_voltage_angles=True)
+
+        res_bus = net.res_bus
+        vm = np.asarray(res_bus["vm_pu"], dtype=np.float64)
+        va = np.deg2rad(np.asarray(res_bus["va_degree"], dtype=np.float64))
+        # res_bus is in pandapower bus order; the PPC internal order used for
+        # Y_matrix may differ, so only accept it when the sizes line up.
+        if vm.shape[0] == N:
+            u_opf_si = (vm * np.exp(1j * va)) * Vbase
+            S_opf_si = u_opf_si * np.conj(
+                np.asarray(Y_matrix, dtype=np.complex128) @ u_opf_si
+            )
+            if "lam_p" in res_bus.columns:
+                lam_p = np.asarray(res_bus["lam_p"], dtype=np.float64)
+            if "lam_q" in res_bus.columns:
+                lam_q = np.asarray(res_bus["lam_q"], dtype=np.float64)
+
+        if n_gen and hasattr(net, "res_gen") and len(net.res_gen) == n_gen:
+            gen_p_opt = np.asarray(net.res_gen["p_mw"], dtype=np.float64)
+            if "q_mvar" in net.res_gen.columns:
+                gen_q_opt = np.asarray(net.res_gen["q_mvar"], dtype=np.float64)
+
+        # Bus-aligned decision space. res_gen alone omits the slack/ext_grid,
+        # which carries a large share of the dispatch (e.g. 194 MW of case14's
+        # total) and has its own cost row in poly_cost. Emitting per-bus vectors
+        # here means downstream code never has to re-derive the dispatch by
+        # differencing injections, nor guess which element owns which limits.
+        (
+            p_disp_bus, q_disp_bus,
+            p_min_bus, p_max_bus, q_min_bus, q_max_bus,
+            cost_c2, cost_c1, cost_c0, is_controllable,
+        ) = _bus_decision_space(net, N)
+
+        opf_cost = float(getattr(net, "res_cost", float("nan")))
+        opf_converged = bool(np.isfinite(opf_cost))
+    except OPFNotConverged:
+        # Genuine non-convergence: expected for a fraction of samples, and the
+        # caller drops these rows. Stays quiet so logs are not flooded.
+        opf_converged = False
+    except Exception as exc:
+        # Anything else is a bug (bad limits, missing cost data, programming
+        # error). Never let it masquerade as a convergence failure: that turns
+        # a broken run into a plausible-looking 0% convergence statistic.
+        opf_converged = False
+        warnings.warn(
+            f"OPF raised a non-convergence error: {type(exc).__name__}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return (
+        u_opf_si, S_opf_si, lam_p, lam_q,
+        gen_p_opt, gen_q_opt, opf_cost, opf_converged,
+        p_disp_bus, q_disp_bus,
+        p_min_bus, p_max_bus, q_min_bus, q_max_bus,
+        cost_c2, cost_c1, cost_c0, is_controllable,
+    )
+
+
 def case_generation_pandapower(
     case_fn: CaseSource,
     case_kwargs: Optional[Dict[str, Any]] = None,
@@ -642,6 +835,15 @@ def case_generation_pandapower(
     contingency_k_cap: int = 2,        # hard cap on simultaneous outages
     admittance_sigma: float = 0.0,     # R/X jitter magnitude (0 disables)
     return_pp_solution: bool = False,
+    # --- Optimal power flow -------------------------------------------------
+    # When return_opf_solution is True the perturbed net is solved with
+    # pp.runopp() instead of (or in addition to) a plain power flow, and the
+    # OPF solution is appended to the returned tuple. Defaults are chosen so
+    # that leaving these alone reproduces the power-flow behaviour exactly.
+    return_opf_solution: bool = False,
+    opf_vm_limits=None,                # (min_vm_pu, max_vm_pu) applied to every bus
+    opf_line_max_loading=None,         # percent, applied to lines and trafos
+    opf_dc: bool = False,              # True -> rundcopp instead of runopp
 ):
     """
     Generic pandapower/CGMES case generator with ONE metadata row per PPC branch row.
@@ -1069,6 +1271,17 @@ def case_generation_pandapower(
         Y_Lines, Y_C_Lines,
         U_base, S_base, vn_kv.astype(np.float64),
     )
+
+    if return_opf_solution:
+        return result + _solve_opf(
+            net,
+            N=N,
+            Vbase=Vbase,
+            Y_matrix=Y_matrix,
+            vm_limits=opf_vm_limits,
+            line_max_loading=opf_line_max_loading,
+            use_dc=opf_dc,
+        )
 
     if not return_pp_solution:
         return result

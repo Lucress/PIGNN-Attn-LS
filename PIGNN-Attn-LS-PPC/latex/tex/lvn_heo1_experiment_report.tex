@@ -1,0 +1,321 @@
+
+\documentclass[10pt]{article}
+\usepackage[margin=0.55in]{geometry}
+\usepackage{booktabs,longtable,tabularx,array,pdflscape,xcolor,hyperref,siunitx}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+\newcommand{\dP}{\Delta P}
+\newcommand{\dQ}{\Delta Q}
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.08}
+\title{LVN Heo1 Grid Experiments: PIGNN-Attn-LS Results Report}
+\author{Generated from Alex cluster logs}
+\date{June 3, 2026}
+\begin{document}
+\maketitle
+\begin{abstract}
+This report inventories the LVN Heo1 experiments found in the PPC and standalone LVN logs. It records the configuration used by each run and the evaluation metrics printed in the logs: voltage RMSE, magnitude RMSE, angle RMSE, active/reactive residual infinity norms, residual distribution statistics when available, and final test metrics when present. The results cover early K=40 informed and flat sweeps, S-base/share-grid reruns, manual loss and k-hop ablations, student-style loss ablations, adapted Armijo variants with and without the nominal-voltage feature, and the Attn8/K40 follow-up jobs.
+\end{abstract}
+
+
+\section{Scope and Log Sources}
+The report was generated from 114 LVN/Heo1 training logs under the Alex cluster result tree and the standalone student LVN run directory. The parser used the last validation epoch as the main metric unless a final test line was printed. Some historical Slurm job-output files interleaved multiple jobs into one output stream; this report uses the corresponding per-run training logs under \texttt{results/logs} where available.
+
+\paragraph{Metric definitions.} RMSE and $|V|$ RMSE are in per-unit voltage coordinates. $\theta$ RMSE is reported in degrees. $\dP_\infty$ and $\dQ_\infty$ are the maximum absolute active/reactive power mismatches printed by the evaluation loop in per-unit coordinates after the configured S-base processing. Mean and p95 residual columns are bus-entry distribution summaries printed only by newer logs.
+
+\section{Experiment Families}
+
+\begin{table}[h]
+\centering
+\caption{Parsed LVN/Heo1 experiment families.}
+\scriptsize
+\begin{tabular}{lrrl}
+\toprule
+Family & Runs & Completed/tested & Typical purpose \\
+\midrule
+K40 DC/flat informed sweep & 26 & 0 & configuration/history sweep or ablation \\
+K40 S-base rebase sweep & 18 & 6 & configuration/history sweep or ablation \\
+K40 flat chunk/geometric sweep & 18 & 12 & configuration/history sweep or ablation \\
+K40 share-grid sweep & 22 & 12 & low-residual K=40 DC/flat sweep with shared grid/Ybus caching \\
+Manual flat k-hop ablation & 12 & 12 & configuration/history sweep or ablation \\
+Manual flat loss ablation & 6 & 6 & configuration/history sweep or ablation \\
+Student standalone package & 10 & 0 & student packaged implementation using converted LVN schema \\
+Student-config loss ablation no-vn & 2 & 0 & configuration/history sweep or ablation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\section{Main Findings}
+\begin{itemize}
+\item The adapted Armijo change removes the MSE deadlock: MSE-only runs now learn and produce the strongest voltage-prediction metrics among the recent loss-ablation jobs.
+\item The nominal-voltage feature \texttt{vn\_log} helps in several DC-start settings, but the no-vn and vn variants are close enough that architecture and optimizer settings matter as much as the extra feature.
+\item The low residuals reported in the earlier Claude status table came from the K=40 share-grid reruns, not from the current Attn8 student-Armijo sweep. Those values are direct log values, not a post-hoc scaling.
+\item Attn8 is useful in supervised MSE settings, especially DC-start A40 K10 Attn8, but PINN-only and PINN+MSE variants often trade better residual behavior for worse voltage angle accuracy or become unstable at late epochs.
+\item K=40 is much more expensive. In the recent A40/A100 K40 runs, several jobs were partial at parse time and did not consistently outperform K=10 on voltage RMSE.
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\caption{Best last-validation total RMSE among parsed LVN/Heo1 logs}
+\scriptsize
+\begin{tabular}{llrrrrrr}
+\toprule
+Family & Case & Ep & RMSE & $|V|$ & $\theta$ deg & $\Delta P_\infty$ & $\Delta Q_\infty$ \\
+\midrule
+K40 flat chunk/geometric swe & Flat PINN/combined & 4e+01 & 0.0406 & 0.0401 & 0.332 & 3.710e+05 & 4.881e+05 \\
+K40 flat chunk/geometric swe & Flat PINN/combined & 4e+01 & 0.0406 & 0.0402 & 0.333 & 3.300e+05 & 4.865e+05 \\
+K40 flat chunk/geometric swe & Flat PINN/combined & 4e+01 & 0.0406 & 0.0402 & 0.335 & 2.034e+05 & 4.947e+05 \\
+K40 flat chunk/geometric swe & Flat PINN/combined & 4e+01 & 0.0406 & 0.0402 & 0.335 & 2.236e+05 & 4.962e+05 \\
+K40 DC/flat informed sweep & Flat PINN/combined & 1e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 \\
+K40 DC/flat informed sweep & Flat PINN/combined & 2e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 \\
+K40 DC/flat informed sweep & Flat PINN/combined & 2e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 \\
+K40 DC/flat informed sweep & Flat PINN/combined & 2e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 \\
+K40 DC/flat informed sweep & Flat PINN/combined & 0 & 0.0407 & 0.0403 & 0.334 & 6.283e+04 & 5.013e+05 \\
+K40 DC/flat informed sweep & Flat PINN/combined & 0 & 0.0407 & 0.0403 & 0.334 & 6.283e+04 & 5.013e+05 \\
+K40 S-base rebase sweep & DC PINN/combined & 2 & 0.0448 & 0.0445 & 0.289 & 306 & 149 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.0448 & 0.0446 & 0.239 & 17.2 & 73.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Best last-validation angle RMSE among parsed LVN/Heo1 logs}
+\scriptsize
+\begin{tabular}{llrrrrrr}
+\toprule
+Family & Case & Ep & RMSE & $|V|$ & $\theta$ deg & $\Delta P_\infty$ & $\Delta Q_\infty$ \\
+\midrule
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.045 & 0.0449 & 0.229 & 16.6 & 88.6 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.0451 & 0.0449 & 0.236 & 29.2 & 70.2 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.045 & 0.0449 & 0.237 & 21.7 & 69.9 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.0448 & 0.0446 & 0.239 & 17.2 & 73.2 \\
+K40 DC/flat informed sweep & DC PINN/combined & 1e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 \\
+K40 DC/flat informed sweep & DC PINN/combined & 1e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 \\
+K40 DC/flat informed sweep & DC PINN/combined & 2e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 \\
+K40 DC/flat informed sweep & DC PINN/combined & 1e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 \\
+K40 S-base rebase sweep & DC PINN/combined & 1 & 0.045 & 0.0448 & 0.241 & 61.2 & 477 \\
+K40 share-grid sweep & DC PINN/combined & 1 & 0.0451 & 0.0449 & 0.242 & 145 & 311 \\
+K40 S-base rebase sweep & DC PINN/combined & 1 & 0.0449 & 0.0447 & 0.249 & 259 & 164 \\
+K40 S-base rebase sweep & DC PINN/combined & 1 & 0.0449 & 0.0447 & 0.254 & 226 & 139 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Best last-validation mean active/reactive residuals among logs that printed residual distributions.}
+\scriptsize
+\begin{tabular}{llrrrrrr}
+\toprule
+Family & Case & Ep & mean $|\dP|$ & mean $|\dQ|$ & p95 $|\dP|$ & p95 $|\dQ|$ & RMSE \\
+\midrule
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.205 & 0.514 & 0.714 & 1.49 & 0.045 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.208 & 0.512 & 0.595 & 1.49 & 0.0451 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.192 & 0.552 & 0.707 & 1.38 & 0.045 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.226 & 0.561 & 0.627 & 1.55 & 0.0448 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.276 & 0.6 & 1.15 & 1.78 & 0.0451 \\
+K40 share-grid sweep & DC PINN/combined & 4e+01 & 0.304 & 0.608 & 1.3 & 1.8 & 0.0451 \\
+K40 S-base rebase sweep & DC PINN/combined & 1 & 0.294 & 1.25 & 0.0598 & 0.886 & 0.045 \\
+K40 share-grid sweep & DC PINN/combined & 1 & 0.786 & 0.937 & 0.947 & 1.41 & 0.0451 \\
+K40 share-grid sweep & DC PINN/combined & 1 & 1.41 & 1.08 & 1.92 & 2.9 & 0.0449 \\
+K40 S-base rebase sweep & DC PINN/combined & 1 & 1.42 & 1.07 & 1.81 & 2.9 & 0.0449 \\
+K40 S-base rebase sweep & DC PINN/combined & 2 & 2.01 & 1.06 & 2.68 & 2.03 & 0.0448 \\
+K40 share-grid sweep & Flat PINN/combined & 4e+01 & 1.69 & 1.58 & 3.05 & 2.01 & 0.0755 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Recent Student-Style and Adapted-Armijo Results}
+
+\begin{landscape}
+\scriptsize
+\begin{longtable}{p{2.1cm}p{2.1cm}p{3.1cm}p{3.5cm}rrrrrrrr}
+\caption{Recent/student-style LVN Heo1 runs: configuration and last validation metrics.}\\
+\toprule
+Family & Case & Dataset & Config & Ep & RMSE & $|V|$ & $\theta$ & $\dP_\infty$ & $\dQ_\infty$ & meanP & meanQ \\
+\midrule
+\endfirsthead
+\toprule
+Family & Case & Dataset & Config & Ep & RMSE & $|V|$ & $\theta$ & $\dP_\infty$ & $\dQ_\infty$ & meanP & meanQ \\
+\midrule
+\endhead
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.045 & 0.0449 & 0.237 & 21.7 & 69.9 & 0.205 & 0.514 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 1 & 0.0451 & 0.0449 & 0.242 & 145 & 311 & 0.786 & 0.937 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.528 & 0.133 & 29.3 & 2.285e+06 & 2.161e+06 & 2.021e+04 & 1.489e+04 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0451 & 0.0448 & 0.256 & 25.4 & 74 & 0.276 & 0.6 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 1 & 0.427 & 0.147 & 23 & 3.288e+06 & 1.303e+06 & 1.728e+04 & 7.672e+03 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 1 & 0.0449 & 0.0447 & 0.256 & 229 & 139 & 1.41 & 1.08 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0451 & 0.0449 & 0.236 & 29.2 & 70.2 & 0.208 & 0.512 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.045 & 0.0449 & 0.229 & 16.6 & 88.6 & 0.192 & 0.552 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 6 & 0.886 & 0.122 & 50.3 & 3.141e+06 & 4.510e+06 & 2.734e+04 & 2.901e+04 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0451 & 0.0448 & 0.256 & 41.4 & 74.4 & 0.304 & 0.608 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 7 & 0.45 & 0.15 & 24.3 & 1.719e+06 & 1.258e+06 & 1.520e+04 & 8.532e+03 \\
+K40 share-grid sweep & DC PINN/combined & DC start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0448 & 0.0446 & 0.239 & 17.2 & 73.2 & 0.226 & 0.561 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0762 & 0.0394 & 3.74 & 222 & 518 & 1.79 & 2.32 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0777 & 0.0393 & 3.84 & 163 & 518 & 1.77 & 1.65 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0754 & 0.0393 & 3.68 & 169 & 518 & 1.71 & 1.59 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 0 & 0.0719 & 0.0395 & 3.44 & 1.842e+03 & 4.177e+03 & 18.4 & 30.2 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.664 & 0.157 & 37 & 2.747e+06 & 2.675e+06 & 2.367e+04 & 1.368e+04 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0764 & 0.0393 & 3.75 & 223 & 518 & 1.76 & 2.27 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 0 & 0.64 & 0.189 & 35 & 4.347e+06 & 7.548e+06 & 3.005e+04 & 6.139e+04 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06 & 0 & 0.0716 & 0.04 & 3.4 & 4.458e+03 & 4.432e+03 & 24.6 & 38.2 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0755 & 0.0393 & 3.69 & 169 & 518 & 1.69 & 1.58 \\
+K40 share-grid sweep & Flat PINN/combined & Flat start & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06 & 4e+01 & 0.0756 & 0.0395 & 3.7 & 171 & 518 & 1.69 & 1.59 \\
+Student standalone pac & Student/converted MS & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted MS & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted MS & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted MS & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted PI & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted PI & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted PI & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted PI & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted PI & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student standalone pac & Student/converted PI & Student converted & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.000 & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{longtable}
+\end{landscape}
+
+
+\section{Configuration Notes}
+The most important configuration axes in the logs are: start condition (DC-informed versus manual flat), solver depth $K$, hidden width $d_{hi}$, number of attention layers, Armijo handling, learning rate, batch size, train/validation/test split, S-base rebase, and whether \texttt{vn\_log} is supplied as an explicit per-bus feature. Historical K=40 runs often used \texttt{BATCH=8}, \texttt{LR=3e-6} or earlier defaults, and train ratio 0.3333. Recent student-style runs use \texttt{BATCH=32}, \texttt{LR=1e-4}, train ratio 0.8, and the adapted Armijo update that always applies the selected step size.
+
+\section{Exhaustive Parsed Results}
+The following appendix table includes every parsed LVN/Heo1 result row. Columns marked ``--'' were not present in the corresponding log. For MSE-only runs, final test lines usually include voltage RMSE only; physics residual distributions are primarily available in PINN-enabled or newer validation logs.
+
+\begin{landscape}
+\tiny
+\begin{longtable}{p{1.25cm}p{1.45cm}p{2.7cm}p{4.2cm}p{0.8cm}rrrrrrrrrrrr}
+\caption{All parsed LVN/Heo1 experiment logs.}\\
+\toprule
+Data & Case & Group & Config & Stat & Ep & RMSE & $|V|$ & $\theta$ & $\dP_\infty$ & $\dQ_\infty$ & meanP & meanQ & p95P & p95Q & TestRMSE & Test$\theta$ \\
+\midrule
+\endfirsthead
+\toprule
+Data & Case & Group & Config & Stat & Ep & RMSE & $|V|$ & $\theta$ & $\dP_\infty$ & $\dQ_\infty$ & meanP & meanQ & p95P & p95Q & TestRMSE & Test$\theta$ \\
+\midrule
+\endhead
+DC start & DC PINN/combined & case300\_informed\_20260421\_214546 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260421\_214546 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260421\_214546 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260421\_214546 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260421\_214546 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260421\_214546 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_080112 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_080112 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_080112 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_080112 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_080112 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_080112 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_083606 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e13 & 1e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_083606 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e13 & 1e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_083606 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & partial e11 & 1e+01 & 0.672 & 0.167 & 37.3 & 2.720e+08 & 1.129e+08 & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_083606 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e15 & 2e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_083606 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & partial e13 & 1e+01 & 0.637 & 0.181 & 35 & 1.395e+08 & 5.784e+07 & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_informed\_20260422\_083606 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e14 & 1e+01 & 0.045 & 0.0448 & 0.241 & 5.985e+03 & 4.773e+04 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260424\_221555 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e11 & 1e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260424\_221555 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e15 & 2e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260424\_221555 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & partial e12 & 1e+01 & 0.793 & 0.211 & 43.8 & 2.709e+08 & 1.614e+08 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260424\_221555 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e15 & 2e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260424\_221555 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e15 & 2e+01 & 0.0407 & 0.0403 & 0.333 & 6.283e+04 & 5.013e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260512\_105502 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e0 & 0 & 0.0407 & 0.0403 & 0.334 & 6.283e+04 & 5.013e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260512\_105502 & K=40, d=4, dhi=16, attn=--, bs=8, lr=0.0001, vn=N, arm=Y & partial e0 & 0 & 0.0407 & 0.0403 & 0.334 & 6.283e+04 & 5.013e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & case300\_informed\_20260512\_105502 & K=40, d=4, dhi=24, attn=--, bs=8, lr=0.0001, vn=N, arm=N & partial e0 & 0 & 1.14 & 0.185 & 64.7 & 4.251e+08 & 6.374e+08 & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e1 & 1 & 0.0449 & 0.0447 & 0.249 & 259 & 164 & 2.1 & 1.55 & 3.52 & 2.79 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e2 & 2 & 0.0448 & 0.0445 & 0.289 & 306 & 149 & 2.01 & 1.06 & 2.68 & 2.03 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e1 & 1 & 1.11 & 0.0993 & 63.3 & 3.010e+06 & 6.218e+06 & 2.122e+04 & 6.265e+04 & 1.749e+04 & 4.548e+04 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e1 & 1 & 0.045 & 0.0448 & 0.241 & 61.2 & 477 & 0.294 & 1.25 & 0.0598 & 0.886 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e1 & 1 & 0.446 & 0.144 & 24.2 & 3.288e+06 & 1.265e+06 & 1.784e+04 & 9.017e+03 & 1.021e+04 & 6.169e+03 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e1 & 1 & 0.0449 & 0.0447 & 0.254 & 226 & 139 & 1.42 & 1.07 & 1.81 & 2.9 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0739 & 0.0393 & 3.59 & 179 & 518 & 2.18 & 2.28 & 5 & 5.54 & 0.0737 & 3.57 \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0721 & 0.0369 & 3.55 & 360 & 585 & 3.22 & 5.22 & 9.18 & 15.9 & 0.072 & 3.54 \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.1 & 0.143 & 62.2 & 3.264e+06 & 6.149e+06 & 2.124e+04 & 6.585e+04 & 1.799e+04 & 4.622e+04 & 1.1 & 62.8 \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0771 & 0.0392 & 3.81 & 363 & 518 & 3 & 2.85 & 9.71 & 5.57 & 0.077 & 3.8 \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 0.502 & 0.195 & 26.5 & 3.241e+06 & 1.292e+06 & 1.728e+04 & 7.799e+03 & 1.146e+04 & 5.290e+03 & 0.501 & 26.4 \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0747 & 0.0402 & 3.61 & 308 & 518 & 3.92 & 2.54 & 10.4 & 7.67 & 0.0746 & 3.6 \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e1 & 1 & 0.073 & 0.0393 & 3.52 & 178 & 518 & 2.52 & 2.74 & 6.17 & 7.91 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e1 & 1 & 0.0716 & 0.0367 & 3.52 & 447 & 594 & 4.39 & 6.62 & 14.9 & 24 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e0 & 0 & 1.2 & 0.13 & 68.1 & 5.702e+06 & 7.778e+06 & 3.213e+04 & 8.339e+04 & 2.664e+04 & 5.723e+04 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e0 & 0 & 0.0726 & 0.0403 & 3.46 & 2.858e+03 & 4.399e+03 & 16.1 & 15 & 3.39 & 3.82 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e1 & 1 & 0.461 & 0.196 & 23.9 & 3.266e+06 & 1.297e+06 & 1.769e+04 & 8.080e+03 & 1.289e+04 & 5.641e+03 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_sbase\_rebase\_20260530\_ & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e0 & 0 & 0.0716 & 0.04 & 3.4 & 4.458e+03 & 4.432e+03 & 24.6 & 38.2 & 10.3 & 16.7 & -- & -- \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260512\_135647 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0406 & 0.0401 & 0.332 & 3.710e+05 & 4.881e+05 & -- & -- & -- & -- & 0.0406 & 0.33 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260512\_135647 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0406 & 0.0402 & 0.335 & 2.236e+05 & 4.962e+05 & -- & -- & -- & -- & 0.0406 & 0.334 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260512\_135647 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.68 & 0.122 & 96 & 3.988e+08 & 6.066e+08 & -- & -- & -- & -- & 1.68 & 96.1 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260512\_135647 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0406 & 0.0402 & 0.333 & 3.300e+05 & 4.865e+05 & -- & -- & -- & -- & 0.0405 & 0.332 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260512\_135647 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 0.895 & 0.221 & 49.7 & 4.012e+08 & 2.545e+08 & -- & -- & -- & -- & 1.04 & 58.5 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260512\_135647 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0406 & 0.0402 & 0.335 & 2.034e+05 & 4.947e+05 & -- & -- & -- & -- & 0.0406 & 0.333 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_135639 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0722 & 0.0401 & 3.44 & 4.862e+05 & 4.870e+05 & -- & -- & -- & -- & 0.072 & 3.42 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_135639 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0722 & 0.0401 & 3.44 & 2.631e+05 & 4.920e+05 & -- & -- & -- & -- & 0.0721 & 3.43 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_135639 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.69 & 0.12 & 96.4 & 4.567e+08 & 5.842e+08 & -- & -- & -- & -- & 1.69 & 96.5 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_135639 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0722 & 0.0401 & 3.44 & 4.354e+05 & 4.797e+05 & -- & -- & -- & -- & 0.0721 & 3.43 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_135639 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 0.695 & 0.225 & 37.7 & 2.298e+08 & 1.125e+08 & -- & -- & -- & -- & 0.692 & 37.6 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_135639 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0722 & 0.0401 & 3.44 & 3.667e+05 & 4.914e+05 & -- & -- & -- & -- & 0.0721 & 3.43 \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_143428 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e10 & 1e+01 & 0.0721 & 0.0401 & 3.43 & 4.671e+05 & 4.863e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_143428 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e11 & 1e+01 & 0.0722 & 0.0401 & 3.44 & 4.636e+05 & 4.911e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_143428 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e12 & 1e+01 & 1.63 & 0.154 & 92.8 & 2.345e+08 & 5.841e+08 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_143428 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e10 & 1e+01 & 0.0721 & 0.04 & 3.43 & 4.763e+05 & 4.827e+05 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_143428 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e13 & 1e+01 & 0.765 & 0.225 & 41.9 & 2.534e+08 & 1.460e+08 & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat PINN/combined & chunk\_geometric\_20260513\_143428 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e11 & 1e+01 & 0.0722 & 0.0401 & 3.44 & 4.178e+05 & 4.884e+05 & -- & -- & -- & -- & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.045 & 0.0449 & 0.237 & 21.7 & 69.9 & 0.205 & 0.514 & 0.714 & 1.49 & 0.045 & 0.237 \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e1 & 1 & 0.0451 & 0.0449 & 0.242 & 145 & 311 & 0.786 & 0.937 & 0.947 & 1.41 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e38 & 4e+01 & 0.528 & 0.133 & 29.3 & 2.285e+06 & 2.161e+06 & 2.021e+04 & 1.489e+04 & 1.457e+04 & 1.111e+04 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0451 & 0.0448 & 0.256 & 25.4 & 74 & 0.276 & 0.6 & 1.15 & 1.78 & 0.0451 & 0.256 \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e1 & 1 & 0.427 & 0.147 & 23 & 3.288e+06 & 1.303e+06 & 1.728e+04 & 7.672e+03 & 1.243e+04 & 4.891e+03 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e1 & 1 & 0.0449 & 0.0447 & 0.256 & 229 & 139 & 1.41 & 1.08 & 1.92 & 2.9 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0451 & 0.0449 & 0.236 & 29.2 & 70.2 & 0.208 & 0.512 & 0.595 & 1.49 & 0.045 & 0.236 \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.045 & 0.0449 & 0.229 & 16.6 & 88.6 & 0.192 & 0.552 & 0.707 & 1.38 & 0.045 & 0.229 \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e6 & 6 & 0.886 & 0.122 & 50.3 & 3.141e+06 & 4.510e+06 & 2.734e+04 & 2.901e+04 & 2.039e+04 & 1.794e+04 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0451 & 0.0448 & 0.256 & 41.4 & 74.4 & 0.304 & 0.608 & 1.3 & 1.8 & 0.0451 & 0.256 \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e7 & 7 & 0.45 & 0.15 & 24.3 & 1.719e+06 & 1.258e+06 & 1.520e+04 & 8.532e+03 & 8.830e+03 & 3.582e+03 & -- & -- \\
+DC start & DC PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0448 & 0.0446 & 0.239 & 17.2 & 73.2 & 0.226 & 0.561 & 0.627 & 1.55 & 0.0448 & 0.239 \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0762 & 0.0394 & 3.74 & 222 & 518 & 1.79 & 2.32 & 3.79 & 2.33 & 0.0762 & 3.74 \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0777 & 0.0393 & 3.84 & 163 & 518 & 1.77 & 1.65 & 3.12 & 2.47 & 0.0776 & 3.84 \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0754 & 0.0393 & 3.68 & 169 & 518 & 1.71 & 1.59 & 3.02 & 2.01 & 0.0753 & 3.68 \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e0 & 0 & 0.0719 & 0.0395 & 3.44 & 1.842e+03 & 4.177e+03 & 18.4 & 30.2 & 11.7 & 5.64 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e38 & 4e+01 & 0.664 & 0.157 & 37 & 2.747e+06 & 2.675e+06 & 2.367e+04 & 1.368e+04 & 1.863e+04 & 1.050e+04 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0764 & 0.0393 & 3.75 & 223 & 518 & 1.76 & 2.27 & 3.33 & 2.13 & 0.0764 & 3.75 \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=N & partial e0 & 0 & 0.64 & 0.189 & 35 & 4.347e+06 & 7.548e+06 & 3.005e+04 & 6.139e+04 & 2.157e+04 & 1.972e+04 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260530\_16 & K=40, d=4, dhi=24, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & partial e0 & 0 & 0.0716 & 0.04 & 3.4 & 4.458e+03 & 4.432e+03 & 24.6 & 38.2 & 10.3 & 16.7 & -- & -- \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0755 & 0.0393 & 3.69 & 169 & 518 & 1.69 & 1.58 & 3.05 & 2.01 & 0.0754 & 3.69 \\
+Flat start & Flat PINN/combined & case300\_configs\_share\_grid\_20260531\_14 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=Y & test & 4e+01 & 0.0756 & 0.0395 & 3.7 & 171 & 518 & 1.69 & 1.59 & 2.64 & 1.81 & 0.0756 & 3.69 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.89 & 0.141 & 108 & 5.460e+08 & 5.589e+08 & 2.825e+06 & 6.417e+06 & 2.758e+06 & 3.744e+06 & 1.88 & 107 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.68 & 0.136 & 96 & 5.111e+08 & 6.469e+08 & 3.171e+06 & 6.420e+06 & 1.736e+06 & 4.011e+06 & 1.8 & 103 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.77 & 0.15 & 101 & 5.217e+08 & 7.430e+08 & 3.102e+06 & 4.004e+06 & 1.983e+06 & 3.069e+06 & 1.76 & 101 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.65 & 0.143 & 94.3 & 4.760e+08 & 7.384e+08 & 2.856e+06 & 5.823e+06 & 2.029e+06 & 2.555e+06 & 1.66 & 94.8 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.78 & 0.126 & 101 & 4.924e+08 & 5.879e+08 & 3.313e+06 & 6.065e+06 & 2.293e+06 & 3.657e+06 & 1.78 & 102 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.78 & 0.134 & 102 & 4.909e+08 & 5.895e+08 & 3.596e+06 & 5.717e+06 & 2.267e+06 & 3.655e+06 & 1.79 & 102 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.73 & 0.146 & 98.6 & 5.199e+08 & 7.532e+08 & 3.098e+06 & 4.106e+06 & 2.251e+06 & 2.514e+06 & 1.73 & 98.6 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.61 & 0.153 & 91.6 & 4.776e+08 & 4.702e+08 & 2.632e+06 & 3.982e+06 & 1.739e+06 & 3.240e+06 & 1.61 & 91.6 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.79 & 0.128 & 102 & 5.064e+08 & 6.035e+08 & 4.058e+06 & 5.348e+06 & 2.300e+06 & 4.125e+06 & 1.8 & 103 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.82 & 0.127 & 104 & 5.448e+08 & 5.899e+08 & 3.601e+06 & 5.939e+06 & 1.923e+06 & 3.439e+06 & 1.82 & 104 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.76 & 0.148 & 100 & 5.198e+08 & 7.538e+08 & 3.812e+06 & 5.489e+06 & 2.399e+06 & 3.075e+06 & 1.79 & 102 \\
+Flat start & Flat PINN/combined & manual\_flat\_khop\_ablation\_20260515\_125 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.64 & 0.146 & 93.7 & 4.789e+08 & 5.897e+08 & 3.168e+06 & 4.823e+06 & 1.744e+06 & 3.305e+06 & 1.68 & 95.6 \\
+Flat start & Flat PINN/combined & manual\_flat\_loss\_ablation\_20260515\_105 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.12 & 0.147 & 63.4 & 1.661e+08 & 2.286e+08 & 1.905e+06 & 1.547e+06 & 1.555e+06 & 1.118e+06 & 1.13 & 64 \\
+Flat start & Flat PINN/combined & manual\_flat\_loss\_ablation\_20260515\_105 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.1 & 0.138 & 62.5 & 1.651e+08 & 2.278e+08 & 1.932e+06 & 1.556e+06 & 2.073e+06 & 1.271e+06 & 1.1 & 62.5 \\
+Flat start & Flat PINN/combined & manual\_flat\_loss\_ablation\_20260515\_105 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 0.969 & 0.154 & 54.8 & 2.758e+08 & 2.054e+08 & 2.457e+06 & 1.393e+06 & 1.785e+06 & 1.152e+06 & 0.976 & 55.2 \\
+Flat start & Flat PINN/combined & manual\_flat\_loss\_ablation\_20260515\_105 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.03 & 0.161 & 58.4 & 1.915e+08 & 1.762e+08 & 2.115e+06 & 1.072e+06 & 2.032e+06 & 1.271e+06 & 1.03 & 58.5 \\
+Flat start & Flat PINN/combined & manual\_flat\_loss\_ablation\_20260515\_105 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.27 & 0.148 & 72.2 & 1.656e+08 & 2.282e+08 & 1.918e+06 & 1.558e+06 & 1.510e+06 & 1.568e+06 & 1.27 & 72.3 \\
+Flat start & Flat PINN/combined & manual\_flat\_loss\_ablation\_20260515\_105 & K=40, d=4, dhi=16, attn=--, bs=8, lr=3e-06, vn=N, arm=N & test & 4e+01 & 1.27 & 0.148 & 72.2 & 1.656e+08 & 2.282e+08 & 1.918e+06 & 1.558e+06 & 1.510e+06 & 1.568e+06 & 1.27 & 72.3 \\
+Student converted & Student/converted MS & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted MS & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted MS & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted MS & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted PI & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted PI & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted PI & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted PI & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted PI & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Student converted & Student/converted PI & student\_standalone\_lvn & K=10, d=4, dhi=16, attn=1, bs=32, lr=0.0001, vn=Y, arm=N & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DC start & DC MSE & loss\_ablation\_20260531\_190946 & K=10, d=4, dhi=16, attn=--, bs=32, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Flat start & Flat MSE & loss\_ablation\_20260531\_190946 & K=10, d=4, dhi=16, attn=--, bs=32, lr=0.0001, vn=N, arm=Y & no epoch & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{longtable}
+\end{landscape}
+
+
+\section{Interpretation and Recommended Next Steps}
+For voltage prediction on the LVN Heo1 grid, the supervised MSE objective remains the cleanest training signal. The adapted Armijo implementation is necessary for MSE-only training because the older reject-step Armijo could detach the voltage prediction from the learned heads. For physics feasibility, the K=40 share-grid experiments show that low residual regimes are possible, but those runs use a different optimization regime from the recent student-style sweeps. The next controlled experiment should therefore rerun the low-residual K=40 share-grid configuration and the best student-style Attn8 MSE configuration under the same split, batch size, learning rate, S-base path, and checkpoint-selection criterion. A residual-aware checkpoint criterion, such as validation mean $|\dP|+|\dQ|$ or NR-polish iterations, should be logged alongside voltage RMSE.
+\end{document}

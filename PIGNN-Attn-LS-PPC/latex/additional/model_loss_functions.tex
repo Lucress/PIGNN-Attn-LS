@@ -1,0 +1,941 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+\emergencystretch=3em
+\sloppy
+
+\newcommand{\pred}[1]{\widehat{#1}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\Real}{\mathbb{R}}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\sig}{\sigma}
+\newcommand{\logp}{\operatorname{log1p}}
+\DeclareMathOperator*{\amax}{max}
+
+\title{Loss Functions of the Neural AC-OPF Surrogates\\
+\large GridFM (\code{gridfm-graphkit}), GridSFM, and LUMINA\\[2pt]
+\normalsize A code-grounded formulation of objectives, constraint handling, and cost treatment}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note writes out, as explicit formulas, the training objective of each of the three
+neural AC-OPF surrogates available here --- \code{gridfm-graphkit}, \code{GridSFM}, and the
+LUMINA SDK --- together with the exact mechanism by which each equality constraint (KCL),
+each inequality constraint (voltage, generator, thermal, angle) and the generation cost
+enters the pipeline. Every formula is traced to the source file and line range that
+implements it, and where a mechanism is \emph{not} present in the shipped code that is
+stated explicitly rather than inferred from the corresponding paper. Two structural facts
+organise the comparison. First (Section~\ref{sec:common}): none of the three solves a KKT
+system at inference; they are learned maps whose constraint satisfaction is either
+\emph{architectural} (guaranteed by an output transformation) or \emph{penalised}
+(encouraged by a training term, hence violable). Second, the three sit at very different
+points on that axis --- GridSFM carries an explicit term for every constraint family and
+for the cost, GridFM carries power-balance and a reactive-limit penalty but no cost term,
+and the released LUMINA objective (Section~\ref{sec:lumina}) is a plain supervised
+regression loss with no physics, no cost, and no Lagrangian at all.
+\end{abstract}
+
+\tableofcontents
+
+% ======================================================================
+\section{Notation and the classical reference problem}
+\label{sec:notation}
+
+Let $\mathcal{N}$ be the bus set, $\mathcal{G}$ the generator set, $\mathcal{E}$ the branch
+set (AC lines and transformers), and $\mathcal{L}$ the load set. The classical AC-OPF is
+\begin{align}
+\min_{P_g,Q_g,V,\theta}\quad
+& C(P_g) \;=\; \sum_{g\in\mathcal{G}}
+\left( c_{2,g} P_{g}^{2} + c_{1,g} P_{g} + c_{0,g}\right)
+\label{eq:opf-obj}\\
+\text{s.t.}\quad
+& P_{i}^{\mathrm{inj}}(V,\theta) \;=\; \textstyle\sum_{g\in\mathcal{G}_i} P_g - \sum_{l\in\mathcal{L}_i} P_{d,l} - G_{s,i}V_i^2,
+&& \forall i\in\mathcal{N}
+\label{eq:kcl-p}\\
+& Q_{i}^{\mathrm{inj}}(V,\theta) \;=\; \textstyle\sum_{g\in\mathcal{G}_i} Q_g - \sum_{l\in\mathcal{L}_i} Q_{d,l} + B_{s,i}V_i^2,
+&& \forall i\in\mathcal{N}
+\label{eq:kcl-q}\\
+& V_i^{\min}\le V_i\le V_i^{\max}, && \forall i\in\mathcal{N}
+\label{eq:vlim}\\
+& P_g^{\min}\le P_g\le P_g^{\max},\qquad Q_g^{\min}\le Q_g\le Q_g^{\max}, && \forall g\in\mathcal{G}
+\label{eq:glim}\\
+& |S_{ij}|\le S_{ij}^{\max},\qquad |S_{ji}|\le S_{ij}^{\max}, && \forall (i,j)\in\mathcal{E}
+\label{eq:therm}\\
+& \Delta\theta_{ij}^{\min}\le \theta_i-\theta_j \le \Delta\theta_{ij}^{\max}, && \forall (i,j)\in\mathcal{E}.
+\label{eq:ang}
+\end{align}
+An interior-point solver (IPOPT via PowerModels.jl, or \code{pandapower}) introduces
+multipliers $\lambda$ for \eqref{eq:kcl-p}--\eqref{eq:kcl-q} and $\mu\ge 0$ for
+\eqref{eq:vlim}--\eqref{eq:ang} and drives the KKT residual of the Lagrangian
+\begin{equation}
+\mathcal{L}(x,\lambda,\mu)=C(P_g)+\lambda^\top h(x)+\mu^\top g(x)
+\label{eq:kkt}
+\end{equation}
+to zero by Newton iteration, per instance. A solution of \eqref{eq:kkt} is denoted with a
+star: $x^\star=(P_g^\star,Q_g^\star,V^\star,\theta^\star)$, with optimal cost
+$C^\star=C(P_g^\star)$.
+
+Predictions of a neural model carry a hat: $\pred{x}=(\pred{P}_g,\pred{Q}_g,\pred{V},\pred\theta)$.
+For a batch of $G$ grids, $b(\cdot)$ maps an element (bus, generator, branch) to its graph
+index, and for a per-element quantity $u$ we write the per-graph mean and per-graph max as
+\begin{equation}
+\langle u\rangle_k \;=\; \frac{1}{|\{e: b(e)=k\}|}\sum_{b(e)=k} u_e,
+\qquad
+[u]^{\amax}_k \;=\; \max_{b(e)=k} u_e ,
+\qquad k=1,\dots,G .
+\label{eq:pergraph}
+\end{equation}
+$\logp(u)=\log(1+u)$, and $\sig(\cdot)$ is the logistic sigmoid.
+
+% ======================================================================
+\section{The structure common to all three models}
+\label{sec:common}
+
+All three models learn a parametric map
+\begin{equation}
+f_\phi:\;\underbrace{(\text{topology},\,P_d,Q_d,\,\text{limits},\,\text{cost coefficients})}_{\text{graph input}}
+\;\longmapsto\;
+(\pred{P}_g,\pred{Q}_g,\pred{V},\pred\theta),
+\label{eq:map}
+\end{equation}
+fitted offline against a dataset of solver solutions $\{x^{\star(n)}\}_{n=1}^{N}$. At
+inference one forward pass replaces the Newton loop; no $\lambda,\mu$ are computed and no
+KKT residual is driven to tolerance. Consequently constraint satisfaction arises only
+through the four mechanisms
+\begin{enumerate}
+\item \textbf{imitation}: a supervised term pulling $\pred{x}$ towards $x^\star$, which is
+      feasible, so $\pred{x}$ inherits approximate feasibility;
+\item \textbf{penalty}: a differentiable residual term added to the loss --- \emph{soft},
+      violable at inference;
+\item \textbf{output transformation}: an algebraic map making a box constraint hold by
+      construction --- \emph{hard}, up to the exact form used;
+\item \textbf{post-hoc evaluation}: a violation metric computed after prediction, with no
+      gradient path.
+\end{enumerate}
+The baseline supervised term shared in spirit by all three is
+\begin{equation}
+L_{\mathrm{sup}}
+=\big\|\pred{P}_g-P_g^\star\big\|^2
++\big\|\pred{Q}_g-Q_g^\star\big\|^2
++\big\|\pred{V}-V^\star\big\|^2
++\big\|\pred\theta-\theta^\star\big\|^2 ,
+\label{eq:sup}
+\end{equation}
+though each implementation reweights, normalises, masks and caps the four blocks
+differently; the exact forms follow.
+
+% ======================================================================
+\section{GridFM (\code{gridfm-graphkit})}
+\label{sec:gridfm}
+
+\subsection{Task formulation: masked reconstruction}
+
+GridFM poses PF, OPF and SE as \emph{masked reconstruction} on a heterogeneous graph with
+node types \code{bus} and \code{gen}. A boolean mask $M$ marks the entries the model must
+reconstruct; unmasked entries are clamped to ground truth inside the network
+(\code{gnn\_heterogeneous\_gns.py:246--247}):
+\begin{equation}
+\pred{u} \;=\; M\odot u_{\mathrm{net}} \;+\; (1-M)\odot u^{\mathrm{given}} .
+\label{eq:gridfm-clamp}
+\end{equation}
+The bus feature vector supplies $P_d,Q_d,Q_g,V_m,V_a$, the bus-type one-hots
+$(\mathrm{PQ},\mathrm{PV},\mathrm{REF})$, the limits $V^{\min},V^{\max},Q_g^{\min},Q_g^{\max}$,
+and the shunts $G_s,B_s$; the generator features supply $P_g,P_g^{\min},P_g^{\max}$ and the
+cost coefficients $c_0,c_1,c_2$ (\code{datasets/globals.py:1--40}). The task therefore
+changes only which columns are masked, not the architecture: for \code{PowerFlow} the loss
+regresses $(V_m,V_a)$; for \code{OptimalPowerFlow} it regresses $(V_m,V_a,Q_g)$ at buses
+plus $P_g$ at generators (\code{training/loss.py:143--148}).
+
+\subsection{Architectural (hard) constraint handling}
+
+Two box constraints are enforced by construction, and only in the OPF task
+(\code{gnn\_heterogeneous\_gns.py:249--260}, using \code{models/utils.py:193--195}):
+\begin{align}
+\pred{V}_i &= V_i^{\min} + \big(V_i^{\max}-V_i^{\min}\big)\,\sig\!\left(z_{V,i}\right),
+\label{eq:gridfm-vbound}\\
+\pred{P}_g &= P_g^{\min} + \big(P_g^{\max}-P_g^{\min}\big)\,\sig\!\left(z_{P,g}\right),
+\label{eq:gridfm-pbound}
+\end{align}
+so \eqref{eq:vlim} and the $P_g$ half of \eqref{eq:glim} hold strictly (open interval) for
+every OPF prediction. In the PF task these two lines are skipped and no box constraint is
+architectural.
+
+Reactive generation is not a free output at all. The OPF physics decoder
+(\code{models/utils.py:82--117}) \emph{derives} $\pred{Q}_g$ from the nodal reactive
+balance at PV and REF buses,
+\begin{equation}
+\pred{Q}_{g,i}
+=\underbrace{Q_{i}^{\mathrm{in}}(\pred{V},\pred\theta)}_{\text{aggregated branch flows}}
++\;Q_{d,i}\;-\;q^{\mathrm{shunt}}_i,
+\qquad
+q^{\mathrm{shunt}}_i = B_{s,i}\pred{V}_i^{2},
+\qquad i\in \mathrm{PV}\cup\mathrm{REF},
+\label{eq:gridfm-qg}
+\end{equation}
+and sets $\pred{Q}_{g,i}=0$ elsewhere. Equation~\eqref{eq:kcl-q} is thus satisfied
+\emph{by construction} at PV/REF buses --- but this consumes the $Q_g$ degree of freedom,
+so the $Q_g$ box \eqref{eq:glim} is \emph{not} guaranteed and needs the penalty of
+Section~\ref{sec:gridfm-qviol}. The branch flows entering \eqref{eq:gridfm-qg} are the
+exact $\pi$-model sending-end flows built from the stored $Y_{ff},Y_{ft}$ columns
+(\code{models/utils.py:25--54}):
+\begin{equation}
+\pred{S}_{ij}=\pred{V}_i\,\overline{\left(Y_{ff,ij}\pred{V}_i+Y_{ft,ij}\pred{V}_j\right)},
+\qquad
+\pred{V}_i=\pred{V}_{m,i}e^{\mathrm{j}\pred{V}_{a,i}},
+\qquad
+P^{\mathrm{in}}_i=\!\!\sum_{(i,j)\in\mathcal{E}}\!\!\Re\{\pred{S}_{ij}\}.
+\label{eq:gridfm-flows}
+\end{equation}
+
+\subsection{The loss terms in the registry}
+
+The trainer builds a weighted sum over a configured list of registered losses
+(\code{MixedLoss}, \code{training/loss.py:270--339}):
+\begin{equation}
+\boxed{\;
+L_{\mathrm{GridFM}}=\sum_{m} w_m\, L_m ,
+\;}
+\label{eq:gridfm-mixed}
+\end{equation}
+with $\{(L_m,w_m)\}$ read from the YAML \code{training.losses} / \code{training.loss\_weights}.
+The individual terms are as follows.
+
+\paragraph{(a) Masked supervised terms.}
+With $\mathcal{M}_{\mathrm{bus}}$ the masked bus entries over the task columns
+$\mathcal{C}$ ($\mathcal{C}=\{V_m,V_a,Q_g\}$ for OPF, $\{V_m,V_a\}$ for PF) and
+$\mathcal{M}_{\mathrm{gen}}$ the masked generator $P_g$ entries
+(\code{training/loss.py:95--160}):
+\begin{equation}
+L_{\mathrm{bus}}=\frac{1}{|\mathcal{M}_{\mathrm{bus}}|}\!\!\sum_{(i,c)\in\mathcal{M}_{\mathrm{bus}}}\!\!\left(\pred{u}_{ic}-u^\star_{ic}\right)^2,
+\qquad
+L_{\mathrm{gen}}=\frac{1}{|\mathcal{M}_{\mathrm{gen}}|}\!\!\sum_{g\in\mathcal{M}_{\mathrm{gen}}}\!\!\left(\pred{P}_g-P^\star_g\right)^2 .
+\label{eq:gridfm-masked}
+\end{equation}
+The unified variant \code{MaskedReconstructionMSE} (\code{training/loss.py:163--245})
+replaces the pair by a single masked MSE over the six bus columns
+$(V_m,V_a,P_g^{\mathrm{agg}},Q_g,P_d,Q_d)$, with the generator targets scattered onto buses,
+$P_{g,i}^{\mathrm{agg}}=\sum_{g\in\mathcal{G}_i}P_g^\star$, and the bus-level $P_g$ mask set
+where \emph{any} generator at that bus is masked.
+
+\paragraph{(b) Layered physics residual --- the KCL penalty actually used.}
+The network re-evaluates the power balance after \emph{every} message-passing layer
+$\ell=0,\dots,L-1$. The per-bus residuals are (\code{models/utils.py:176--190})
+\begin{align}
+r^{P,(\ell)}_i &= \pred{P}^{(\ell)}_{g,i}-P_{d,i}+p^{\mathrm{shunt},(\ell)}_i-P^{\mathrm{in},(\ell)}_i,
+& p^{\mathrm{shunt}}_i&=-G_{s,i}\pred{V}_i^2,
+\label{eq:gridfm-rp}\\
+r^{Q,(\ell)}_i &= \pred{Q}^{(\ell)}_{g,i}-Q_{d,i}+q^{\mathrm{shunt},(\ell)}_i-Q^{\mathrm{in},(\ell)}_i,
+& q^{\mathrm{shunt}}_i&=+B_{s,i}\pred{V}_i^2,
+\label{eq:gridfm-rq}
+\end{align}
+and are reduced to one scalar per layer (\code{gnn\_heterogeneous\_gns.py:295--299}):
+\begin{equation}
+R^{(\ell)}=\Big\langle \big\|(r^{P,(\ell)}_i,\,r^{Q,(\ell)}_i)\big\|_2 \Big\rangle_{i\in\mathcal{N}} .
+\label{eq:gridfm-Rl}
+\end{equation}
+\code{LayeredWeightedPhysics} (\code{training/loss.py:342--381}) combines them with
+normalised geometric weights of ratio $\beta=$ \code{base\_weight} (0.5 in the shipped
+configs), so later layers dominate:
+\begin{equation}
+\boxed{\;
+L_{\mathrm{phys}}=\sum_{\ell=0}^{L-1} \tilde w_\ell\, R^{(\ell)},
+\qquad
+\tilde w_\ell=\frac{\beta^{\,L-1-\ell}}{\sum_{m=0}^{L-1}\beta^{\,L-1-m}} .
+\;}
+\label{eq:gridfm-layered}
+\end{equation}
+The same residual is also fed back into the latent state,
+$h^{(\ell)}_{\mathrm{bus}}\!\leftarrow\! h^{(\ell)}_{\mathrm{bus}}+\mathrm{MLP}(r^{P,(\ell)},r^{Q,(\ell)})$
+(\code{gnn\_heterogeneous\_gns.py:300}), which is what makes this a physics-\emph{informed}
+architecture rather than only a physics-penalised one.
+
+\paragraph{(c) Full-Ybus power-balance loss (\code{PBE}, alternative).}
+\code{PBELoss} (\code{training/loss.py:445--636}) assembles the complete sparse admittance
+matrix from the edge attributes plus the shunt diagonal
+$Y_{ii}\mathrel{+}= G_{s,i}+\mathrm{j}B_{s,i}$, then penalises the complex mismatch in
+$L_1$:
+\begin{equation}
+\boxed{\;
+L_{\mathrm{PBE}}
+=\Big\langle\;\big| \pred{S}^{\mathrm{net}}_i - \pred{V}_i\,(\overline{Y}\,\overline{\pred{V}})_i \big|\;\Big\rangle_{i\in\mathcal{N}},
+\qquad
+\pred{S}^{\mathrm{net}}_i=(\pred{P}_{g,i}-\pred{P}_{d,i})+\mathrm{j}(\pred{Q}_{g,i}-\pred{Q}_{d,i}),
+\;}
+\label{eq:gridfm-pbe}
+\end{equation}
+each entry of $\pred{S}^{\mathrm{net}}$ again clamped to ground truth where unmasked, per
+\eqref{eq:gridfm-clamp}. The real and imaginary parts are logged separately as the active
+and reactive power loss in p.u.
+
+\paragraph{(d) Reactive-limit penalty.}
+\label{sec:gridfm-qviol}
+\code{QgViolationPenalty} (\code{training/loss.py:639--685}) is a one-sided hinge on the
+$Q_g$ box, averaged \emph{only over the violating buses}:
+\begin{equation}
+\boxed{\;
+L_{Q_g\text{-viol}}
+=\underbrace{\Big\langle \relu\!\big(\pred{Q}_{g,i}-Q^{\max}_{g,i}\big)\Big\rangle_{i:\,\pred{Q}_{g,i}>Q^{\max}_{g,i}}}_{\text{overshoot}}
++\underbrace{\Big\langle \relu\!\big(Q^{\min}_{g,i}-\pred{Q}_{g,i}\big)\Big\rangle_{i:\,\pred{Q}_{g,i}<Q^{\min}_{g,i}}}_{\text{undershoot}} ,
+\;}
+\label{eq:gridfm-qviol}
+\end{equation}
+with empty-set NaNs replaced by $0$. Note this is a \emph{mean over violators}, not a mean
+over all buses: the gradient magnitude does not shrink as the number of violating buses
+falls.
+
+\paragraph{Instantiation used in the shipped OPF configs.}
+For \code{HGNS\_OPF\_datakit\_case118.yaml} the objective is exactly
+\begin{equation}
+L_{\mathrm{GridFM}}^{\mathrm{OPF}}
+= 0.1\,L_{\mathrm{phys}}
++ 0.1\,L_{\mathrm{gen}}
++ 0.75\,L_{\mathrm{bus}}
++ 0.001\,L_{Q_g\text{-viol}} ,
+\label{eq:gridfm-instance}
+\end{equation}
+whereas the PF config uses $0.1\,L_{\mathrm{phys}}+0.9\,L_{\mathrm{bus}}$.
+
+\subsection{Generation cost in GridFM}
+
+There is \textbf{no cost term in any registered GridFM loss}. The cost coefficients
+$c_0,c_1,c_2$ are input features, and the quadratic cost is evaluated only in
+\code{tasks/opf\_task.py:84--102}, inside \code{test\_step}, as a reported metric:
+\begin{equation}
+\pred{C}_k=\!\!\sum_{g:\,b(g)=k}\!\!\left(c_{0,g}+c_{1,g}\pred{P}_g+c_{2,g}\pred{P}_g^2\right),
+\qquad
+\mathrm{gap}=\Big\langle \big|\pred{C}_k-C^\star_k\big|/C^\star_k\Big\rangle_k\times 100\% .
+\label{eq:gridfm-gap}
+\end{equation}
+Cost therefore reaches the parameters \emph{only} through the labels $P^\star_g$ in
+\eqref{eq:gridfm-masked}, which were produced by a cost-minimising solver. The precise
+statement is: GridFM's forward pass runs no optimiser over $C$, and its training gradient
+contains no $\partial C/\partial\pred{P}_g$ contribution; it learns the cost-optimal
+dispatch by imitation. Thermal limits \eqref{eq:therm} and angle limits \eqref{eq:ang} are
+likewise \emph{evaluation-only} in this codebase --- $\relu(|\pred{S}_{ft}|-S^{\max})$ is
+computed in \code{test\_step} (\code{opf\_task.py:125--135}) and never in a training loss.
+
+% ======================================================================
+\section{GridSFM}
+\label{sec:gridsfm}
+
+GridSFM is the only one of the three whose released training objective contains an explicit
+term for \emph{every} category: imitation, cost, KCL, branch flow, thermal loading, thermal
+limit, physics stress, and feasibility. All of it lives in
+\code{GridSFM/model/gridsfm/loss.py}.
+
+\subsection{Predictions and architectural (hard) constraint handling}
+
+The heads emit $\pred{x}=(\pred\theta,\pred{V})$ per bus, $(\pred{P}_g,\pred{Q}_g)$ per
+generator, and one feasibility logit per graph. Box constraints are imposed by a
+\emph{leaky clip} (\code{blocks.py:43--46}), applied with a mid-range offset for the
+generator heads (\code{model.py:234--261}):
+\begin{align}
+\mathrm{lclip}(u;\ell,h)&=\operatorname{clamp}(u,\ell,h)+\alpha\Big[\relu(u-h)-\relu(\ell-u)\Big],
+\label{eq:sfm-lclip}\\
+\pred{P}_g&=\mathrm{lclip}\!\left(z_{P,g}+\tfrac12(P^{\min}_g+P^{\max}_g);\,P^{\min}_g,P^{\max}_g\right),
+\label{eq:sfm-pg}\\
+\pred{Q}_g&=\mathrm{lclip}\!\left(z_{Q,g}+\tfrac12(Q^{\min}_g+Q^{\max}_g);\,Q^{\min}_g,Q^{\max}_g\right),
+\label{eq:sfm-qg}\\
+\pred{V}_i&=\mathrm{lclip}\!\left(z_{V,i};\,V^{\min}_i,V^{\max}_i\right).
+\label{eq:sfm-v}
+\end{align}
+With the default leak $\alpha=0$ (\code{model.py:63}) equations
+\eqref{eq:sfm-pg}--\eqref{eq:sfm-v} enforce \eqref{eq:vlim} and \eqref{eq:glim}
+\emph{exactly}; for $\alpha>0$ they are enforced up to an $\alpha$-scaled excursion that
+keeps a gradient alive outside the box. The angle head is a DC-prior residual, anchored at
+the slack bus (\code{model.py:243--248}):
+\begin{equation}
+\pred\theta = \operatorname{anchor}\!\Big(
+\pi\tanh\!\big(\theta^{\mathrm{DC}}/\pi\big)
++ s\tanh\!\big(z_\theta/s\big)\Big),
+\qquad s=\code{theta\_res\_scale},
+\label{eq:sfm-theta}
+\end{equation}
+which bounds $\pred\theta$ globally but does \emph{not} enforce the per-branch angle
+difference limits \eqref{eq:ang}.
+
+\subsection{Branch flows and residuals}
+
+Flows use the full $\pi$-model with off-nominal tap $\tau$ and phase shift $\phi$, in both
+directions (\code{loss.py:185--209}); with $g+\mathrm{j}b=(r+\mathrm{j}x)^{-1}$ and
+$\delta=\pred\theta_i-\pred\theta_j-\phi$:
+\begin{align}
+\pred{P}_{ij}&=\frac{g\,\pred{V}_i^2}{\tau^2}-\frac{\pred{V}_i\pred{V}_j}{\tau}\big(g\cos\delta+b\sin\delta\big),
+&
+\pred{Q}_{ij}&=-\frac{(b+b_{\mathrm{fr}})\pred{V}_i^2}{\tau^2}+\frac{\pred{V}_i\pred{V}_j}{\tau}\big(b\cos\delta-g\sin\delta\big),
+\label{eq:sfm-flow-ij}\\
+\pred{P}_{ji}&=g\,\pred{V}_j^2-\frac{\pred{V}_i\pred{V}_j}{\tau}\big(g\cos\delta-b\sin\delta\big),
+&
+\pred{Q}_{ji}&=-(b+b_{\mathrm{to}})\pred{V}_j^2+\frac{\pred{V}_i\pred{V}_j}{\tau}\big(b\cos\delta+g\sin\delta\big).
+\label{eq:sfm-flow-ji}
+\end{align}
+The KCL residuals recompute the flows from $(\pred\theta,\pred{V})$ rather than reading the
+separate edge head, deliberately, so that the term is a genuine physics check on the bus
+state (\code{loss.py:265--317}):
+\begin{align}
+r^P_i &= \underbrace{\textstyle\sum_{j}\pred{P}_{ij}+\sum_j \pred{P}_{ji}}_{\text{flow out of }i}
+\;-\;\Big(\pred{P}_{g,i}-P_{d,i}-G_{s,i}\pred{V}_i^2\Big),
+\label{eq:sfm-rp}\\
+r^Q_i &= \textstyle\sum_{j}\pred{Q}_{ij}+\sum_j \pred{Q}_{ji}
+\;-\;\Big(\pred{Q}_{g,i}-Q_{d,i}+B_{s,i}\pred{V}_i^2\Big).
+\label{eq:sfm-rq}
+\end{align}
+
+\subsection{The nine loss terms}
+
+Write $\mathcal{F}=\{k:\ \text{feasible}_k=1\}$ for the feasible subset of the batch; all
+regression terms are masked to $\mathcal{F}$ (\code{loss.py:97--119}), because the synthetic
+wrapper injects infeasible samples whose ``labels'' are not solutions. Let
+$\kappa=\code{PER\_ELEM\_CAP}=100$ and define the soft cap
+$\mathrm{cap}(u)=\kappa\tanh(u/\kappa)$.
+
+\paragraph{(1--4) Capped, normalised imitation.}
+(\code{loss.py:690--728}) The angle error is taken on the circle and against the identically
+anchored label; the voltage error is standardised by the per-graph label spread
+$s_k=\max(\operatorname{std}_k(V^\star),0.01)$:
+\begin{align}
+L_\theta&=\Big\langle\Big\langle \mathrm{cap}\big(\operatorname{atan2}(\sin\Delta_i,\cos\Delta_i)^2\big)\Big\rangle_{i\in k}\Big\rangle_{k\in\mathcal{F}},
+&&\Delta_i=\pred\theta_i-\operatorname{anchor}(\theta^\star)_i,
+\label{eq:sfm-Ltheta}\\
+L_V&=\Big\langle\Big\langle \mathrm{cap}\big((\pred{V}_i-V^\star_i)^2/s_{b(i)}^2\big)\Big\rangle_{i\in k}\Big\rangle_{k\in\mathcal{F}},
+\label{eq:sfm-LV}\\
+L_{P_g}&=\Big\langle\Big\langle \mathrm{cap}\big((\pred{P}_g-P^\star_g)^2\big)\Big\rangle_{g\in k}\Big\rangle_{k\in\mathcal{F}},
+\label{eq:sfm-Lpq}\\
+L_{Q_g}&=\Big\langle\Big\langle \mathrm{cap}\big((\pred{Q}_g-Q^\star_g)^2\big)\Big\rangle_{g\in k}\Big\rangle_{k\in\mathcal{F}} .
+\label{eq:sfm-Lqg}
+\end{align}
+The $\tanh$ cap is what keeps a single pathological bus from owning the whole gradient.
+
+\paragraph{(5) KCL, capacity-normalised with a worst-bus tilt.}
+(\code{loss.py:590--631}) Residuals are normalised by the per-graph \emph{generation
+capacity} $D^P_k=\sum_{g\in k}|P^{\max}_g|$, $D^Q_k=\sum_{g\in k}|Q^{\max}_g|$ --- not by
+demand, so that the term is invariant to the load-spike perturbation modes used to
+synthesise infeasible samples. With $\rho^P_i=|r^P_i|/D^P_{b(i)}$, margin
+$\epsilon=0.01$ and tilt $w=0.8$:
+\begin{equation}
+\boxed{\;
+L_{\mathrm{KCL},P}
+=\Big\langle\;
+w\,\big[\relu(\rho^P_i-\epsilon)\big]^{\amax}_k
++(1-w)\,\big\langle \rho^P_i\big\rangle_k
+\;\Big\rangle_{k\in\mathcal{F}} ,
+\;}
+\label{eq:sfm-kcl}
+\end{equation}
+and identically for $L_{\mathrm{KCL},Q}$ with $\rho^Q$. The $80\%$ weight on the worst bus
+means the term behaves closer to an $\ell_\infty$ than an $\ell_2$ penalty.
+
+\paragraph{(6) Supervised branch flow.}
+(\code{loss.py:531--552}) Against the solver's four-column edge label, in raw p.u.$^2$,
+macro-averaged over edge types and graphs:
+\begin{equation}
+L_{\mathrm{br},P}=\Big\langle\big(\pred{P}_{ij}-P^\star_{ij}\big)^2+\big(\pred{P}_{ji}-P^\star_{ji}\big)^2\Big\rangle_{\mathcal{E},\,\mathcal{F}},
+\qquad
+L_{\mathrm{br},Q}\ \text{analogously}.
+\label{eq:sfm-br}
+\end{equation}
+
+\paragraph{(7) Supervised thermal loading.}
+(\code{loss.py:557--582}) With the tolerance-inflated rating
+$S^{\max}_{\mathrm{eff}}=\sqrt{(S^{\max})^2+10^{-4}}$ and the worst-end convention
+$\eta=\max(|S_{ij}|,|S_{ji}|)/S^{\max}_{\mathrm{eff}}$:
+\begin{equation}
+L_{\mathrm{therm}}=\Big\langle \logp\!\big((\pred\eta_e-\eta^\star_e)^2\big)\Big\rangle_{\mathcal{E},\,\mathcal{F}} .
+\label{eq:sfm-loading}
+\end{equation}
+
+\paragraph{(8) Thermal-limit barrier with soft top-$k$ focus.}
+(\code{loss.py:472--526}) This is the term that actually pushes \eqref{eq:therm}. Per rated
+branch, with $\beta=8$ and $\varepsilon_{\mathrm{mean}}=0.05$:
+\begin{equation}
+\boxed{\;
+v_e=\logp\!\big(\relu(\pred\eta_e-1)\big),
+\qquad
+L_{\mathrm{lim}}
+=\Big\langle
+\underbrace{\sum_{e\in k}\frac{e^{\beta v_e}}{\sum_{e'\in k}e^{\beta v_{e'}}}\,v_e}_{\text{soft-max over branches}}
++\;\varepsilon_{\mathrm{mean}}\,\langle v_e\rangle_k
+\Big\rangle_{k} .
+\;}
+\label{eq:sfm-thermlim}
+\end{equation}
+The softmax weighting makes the term concentrate on the most overloaded branches of each
+grid (a differentiable surrogate for $\max_e v_e$) while the $\varepsilon_{\mathrm{mean}}$
+tail keeps a gradient on the rest.
+
+\paragraph{(9) Physics-stress regulariser --- where angle limits enter.}
+(\code{loss.py:741--758}, \code{stress\_features.py}) A 24-dimensional per-graph stress
+vector is computed; its first $18$ dimensions are violation statistics
+$(\text{mean},\max,\text{fraction}>10^{-3})$ of six families --- voltage, $\mathrm{KCL}_P$,
+$\mathrm{KCL}_Q$, thermal, angle, and cycle/KVL imbalance --- with
+\begin{align}
+\text{voltage:}\quad & \relu(V^{\min}_i-\pred{V}_i)+\relu(\pred{V}_i-V^{\max}_i),
+\label{eq:sfm-stress-v}\\
+\text{thermal:}\quad & \relu\!\big(\max(|\pred{S}_{ij}|,|\pred{S}_{ji}|)/S^{\max}_{ij}-1\big),
+\label{eq:sfm-stress-t}\\
+\text{angle:}\quad & \relu\!\Big(\big|\pred\theta_i-\pred\theta_j-\phi_{ij}\big|\big/\Delta\theta^{\max}_{ij}-1\Big),
+\label{eq:sfm-stress-a}\\
+\text{KVL:}\quad & \Big|\textstyle\sum_{e\in c}\sigma_{ce}\,\big(\Delta\pred\theta_e-\phi_e\big)\Big|
+\quad\text{over cycles } c ,
+\label{eq:sfm-stress-kvl}
+\end{align}
+the remaining six dimensions being non-violation capacity-utilisation features. The
+regulariser targets those 18 at zero:
+\begin{equation}
+\boxed{\;
+L_{\mathrm{stress}}
+=\Big\langle \logp\!\big(|\,\mathrm{stress}_{k,1:18}|\big)\Big\rangle_{k\in\mathcal{F}} .
+\;}
+\label{eq:sfm-stress}
+\end{equation}
+So the angle limits \eqref{eq:ang} and KVL are present in the objective, but only through
+this pooled statistic --- three numbers per family per graph --- rather than as a per-branch
+barrier of the form \eqref{eq:sfm-thermlim}. This is the precise sense in which GridSFM
+handles angle limits \emph{indirectly}.
+
+\paragraph{(10) Cost matching in log space.}
+(\code{loss.py:636--646}, \code{730--735}) With the per-graph quadratic cost
+\begin{equation}
+\pred{C}_k=\!\!\sum_{g:\,b(g)=k}\!\!\Big(c_{2,g}\pred{P}_g^2+c_{1,g}\pred{P}_g+c_{0,g}\Big),
+\qquad
+C^\star_k \text{ the same formula at } P^\star_g \ \text{(detached)},
+\label{eq:sfm-cost-def}
+\end{equation}
+the loss is a squared log-ratio, \emph{not} a minimisation of $\pred{C}$:
+\begin{equation}
+\boxed{\;
+L_{\mathrm{cost}}
+=\Big\langle\Big(\logp(\pred{C}_k)-\logp(C^\star_k)\Big)^{2}\Big\rangle_{k\in\mathcal{F}} .
+\;}
+\label{eq:sfm-cost}
+\end{equation}
+This is the important asymmetry with \eqref{eq:opf-obj}: the term is minimised at
+$\pred{C}_k=C^\star_k$, so it penalises \emph{under}-cost as hard as over-cost. A free
+minimisation of $\pred{C}$ would collapse to $\pred{P}_g\to P^{\min}_g$; matching the
+optimal cost cannot. The $\log$ makes the term scale-free across grids whose costs differ
+by orders of magnitude.
+
+\paragraph{(11) Feasibility classification.}
+(\code{loss.py:737--739}) On the \emph{whole} batch, including the synthetic infeasible
+samples:
+\begin{equation}
+L_{\mathrm{feas}}=\operatorname{BCEWithLogits}\!\big(\,\pred{z}^{\mathrm{feas}},\ \text{feasible}\,\big)
+=-\Big\langle y_k\log\sig(\pred z_k)+(1-y_k)\log\big(1-\sig(\pred z_k)\big)\Big\rangle_k .
+\label{eq:sfm-feas}
+\end{equation}
+The head reads the stress vector \eqref{eq:sfm-stress-v}--\eqref{eq:sfm-stress-kvl} of the
+model's \emph{own} prediction (\code{model.py:273--281}), so the classifier answers ``does
+my predicted operating point look physically strained'' rather than inspecting the raw
+instance alone.
+
+\subsection{Total objective}
+
+Assembling \code{loss.py:773--782} with its default multipliers:
+\begin{equation}
+\boxed{
+\begin{aligned}
+L_{\mathrm{GridSFM}}
+={}& L_\theta+L_V+L_{P_g}+L_{Q_g}
+\;+\;\lambda_{\mathrm{feas}}L_{\mathrm{feas}}
+\;+\;\lambda_{\mathrm{cost}}L_{\mathrm{cost}}
+\;+\;\lambda_{\mathrm{stress}}L_{\mathrm{stress}}\\
+&+\lambda_{\mathrm{KCL},P}\,\logp\!\big(L_{\mathrm{KCL},P}\big)
++\lambda_{\mathrm{KCL},Q}\,\logp\!\big(L_{\mathrm{KCL},Q}\big)\\
+&+\lambda_{\mathrm{br},P}\,\logp\!\big(L_{\mathrm{br},P}\big)
++\lambda_{\mathrm{br},Q}\,\logp\!\big(L_{\mathrm{br},Q}\big)
++\lambda_{\mathrm{therm}}L_{\mathrm{therm}}
++\lambda_{\mathrm{lim}}L_{\mathrm{lim}} ,
+\end{aligned}}
+\label{eq:sfm-total}
+\end{equation}
+\begin{gather*}
+\lambda_{\mathrm{feas}}=0.1,\qquad
+\lambda_{\mathrm{cost}}=1,\qquad
+\lambda_{\mathrm{stress}}=0.1,\qquad
+\lambda_{\mathrm{therm}}=1,\qquad
+\lambda_{\mathrm{lim}}=5,\\
+\lambda_{\mathrm{KCL},P}=\lambda_{\mathrm{KCL},Q}=\lambda_{\mathrm{br},P}=\lambda_{\mathrm{br},Q}=1 .
+\end{gather*}
+The outer $\logp$ on the four residual terms is a deliberate compressor: it bounds the
+gradient contribution of an early-training KCL blow-up ($\partial\logp(L)/\partial L
+=1/(1+L)$), so no single physics term can suppress the supervised signal. Note that the
+logged diagnostics \code{parts['L\_kcl\_p']} etc.\ are the \emph{raw} pre-$\logp$ values,
+while the contribution to \eqref{eq:sfm-total} is the compressed one.
+
+% ======================================================================
+\section{LUMINA}
+\label{sec:lumina}
+
+\subsection{The two artefacts, and which one answers which question}
+
+Two LUMINA code drops are present, and they answer different questions:
+\begin{itemize}
+\item \code{LUMINA/src/lumina\_inference} --- an \textbf{inference-only} package: a 6-layer,
+      128-channel, 2-head HGT with $0.244$ dropout over the node types $\{$\code{bus},
+      \code{generator}, \code{load}, \code{shunt}$\}$ (\code{checkpoints/lumina\_config.json}),
+      a dataset adapter, and a \code{Modeler} wrapper. No loss module, no optimiser, no
+      training loop.
+\item \code{lumina-sdk} --- the full SDK
+      (\url{https://github.com/argonne-gridfm/lumina-sdk}, \code{main} at \code{f78cfae},
+      2026-07-13), which \emph{does} ship the training stack: \code{lumina/model/opf/losses.py},
+      \code{lumina/trainer/opf/trainer.py}, \code{lumina/evaluator/opf/evaluator.py}, and the
+      configs under \code{configs/}.
+\end{itemize}
+Everything in this section is now line-traceable in the SDK. The result is more restrictive
+than the paper-level description would suggest, so it is worth stating the headline first:
+\emph{the released LUMINA training objective is a plain supervised regression loss. It
+contains no power-balance term, no thermal term, no cost term, and no Lagrangian.}
+
+\subsection{Predictions and architectural (hard) box constraints}
+
+Every heterogeneous architecture in the SDK (\code{OPFHeteroGNN}, \code{RGAT}, \code{HEAT},
+\code{HGT}) emits two channels per bus and two per generator,
+\begin{equation}
+\pred{y}_{\mathrm{bus}}=(\pred\theta,\pred{V}_m)\in\Real^{N_b\times 2},
+\qquad
+\pred{y}_{\mathrm{gen}}=(\pred{P}_g,\pred{Q}_g)\in\Real^{N_g\times 2},
+\label{eq:lum-heads}
+\end{equation}
+and each caches the raw limit columns of the \emph{unnormalised} inputs before the first
+projection, then rescales through a sigmoid when \code{minmax\_scaling=True}
+(\code{lumina/model/opf/hetero\_model.py:186--196, 333--343, 546--554, 712--722}):
+\begin{align}
+\pred{V}_i &= V^{\min}_i+\big(V^{\max}_i-V^{\min}_i\big)\,\sig\!\big(z_{V,i}\big),
+&& V^{\min}=x^{\mathrm{bus}}_{:,1},\; V^{\max}=x^{\mathrm{bus}}_{:,2},
+\label{eq:lum-v}\\
+\pred{P}_g &= P^{\min}_g+\big(P^{\max}_g-P^{\min}_g\big)\,\sig\!\big(z_{P,g}\big),
+&& P^{\min}=x^{\mathrm{gen}}_{:,2},\; P^{\max}=x^{\mathrm{gen}}_{:,3},
+\label{eq:lum-p}\\
+\pred{Q}_g &= Q^{\min}_g+\big(Q^{\max}_g-Q^{\min}_g\big)\,\sig\!\big(z_{Q,g}\big),
+&& Q^{\min}=x^{\mathrm{gen}}_{:,5},\; Q^{\max}=x^{\mathrm{gen}}_{:,6},
+\label{eq:lum-q}
+\end{align}
+the column indices matching the loader layout
+$x^{\mathrm{bus}}=[\,\mathrm{base\_kv},V^{\min},V^{\max},\mathrm{onehot}(\mathrm{bus\_type})\,]\in\Real^{7}$
+and
+$x^{\mathrm{gen}}=[\,\mathrm{mbase},P_g,P^{\min},P^{\max},Q_g,Q^{\min},Q^{\max},V_g,c_2,c_1,c_0\,]\in\Real^{11}$
+(\code{docs/opfdata\_schema.md}, \code{dataset/opf/opf\_dataset.py:700--710}). Since
+$0<\sig(z)<1$ strictly, \eqref{eq:vlim} and \eqref{eq:glim} hold with strict inequality for
+every prediction --- a genuine architectural guarantee, the same mechanism as GridFM's
+\eqref{eq:gridfm-vbound}--\eqref{eq:gridfm-pbound}, extended to $Q_g$. The trainer defaults
+to \code{minmax\_scaling=True} (\code{trainer/opf/trainer.py:141}), so this is the normal
+training and inference regime. Three qualifications:
+\begin{itemize}
+\item The bus \emph{angle} channel is passed through untransformed, so nothing bounds
+      $\pred\theta$ or the angle differences \eqref{eq:ang}.
+\item With \code{minmax\_scaling=False} no constraint is enforced anywhere; the guarantee is
+      a property of the call, not of the checkpoint.
+\item The model forward signatures accept \code{edge\_attr\_dict}, but the trainer never
+      supplies it (\code{trainer.py:1387} calls the model with \code{x\_dict} and
+      \code{edge\_index\_dict} only), and \code{HGT} --- the released checkpoint's
+      architecture --- ignores it regardless, since \code{HGTConv} is invoked as
+      \code{conv(x\_dict, edge\_index\_dict)} (\code{hetero\_model.py:844}). Branch
+      $r,x,b,\tau,\phi$ and the ratings $S^{\max}$ therefore never enter the hetero training
+      path at all. (\code{HEAT} and the \code{gat} backend do project edge attributes ---
+      \code{hetero\_model.py:695--700} --- but only if a caller passes them.)
+\end{itemize}
+
+\subsection{The actual training loss: per-node-type supervised regression}
+
+\code{ACOPFLossFunction} (\code{lumina/model/opf/losses.py:83--348}) is the whole objective.
+Targets are the solver solution channels, $y_{\mathrm{bus}}=(\theta^\star,V^\star_m)$ and
+$y_{\mathrm{gen}}=(P^\star_g,Q^\star_g)$, extracted as \code{batch[node\_type].y}. Rows with
+any non-finite target are dropped by a finite mask $\mathcal{V}_t$
+(\code{losses.py:184--193}), and the per-type losses are combined with node weights
+$w_t$ (default $w_{\mathrm{bus}}=w_{\mathrm{gen}}=1$):
+\begin{equation}
+\boxed{\;
+L_{\mathrm{LUMINA}}
+=\sum_{t\in\{\mathrm{bus},\,\mathrm{gen}\}} w_t\;
+\ell\!\left(\pred{y}_t[\mathcal{V}_t],\;y_t[\mathcal{V}_t]\right),
+\;}
+\label{eq:lum-total}
+\end{equation}
+where $\ell$ is \emph{one} of five element-wise choices, selected by \code{loss\_type}
+(\code{configs/loss/mse.yaml}, \code{docs/tutorials/training.md}), reduced by mean over all
+$N$ surviving elements $\times$ channels:
+\begin{align}
+\text{\code{mse}:}\quad & \ell=\tfrac{1}{N}\textstyle\sum_n (\pred{y}_n-y_n)^2,
+\label{eq:lum-mse}\\
+\text{\code{mae}:}\quad & \ell=\tfrac{1}{N}\textstyle\sum_n |\pred{y}_n-y_n|,
+\label{eq:lum-mae}\\
+\text{\code{rmse}:}\quad & \ell=\tfrac{1}{N}\textstyle\sum_n \sqrt{(\pred{y}_n-y_n)^2+\epsilon},
+\qquad \epsilon=10^{-8},
+\label{eq:lum-rmse}\\
+\text{\code{mape}:}\quad & \ell=\tfrac{1}{N}\textstyle\sum_n \dfrac{|\pred{y}_n-y_n|}{|y_n|+\epsilon},
+\label{eq:lum-mape}\\
+\text{\code{smooth\_l1}:}\quad & \ell=\tfrac{1}{N}\textstyle\sum_n
+\begin{cases}
+\dfrac{(\pred{y}_n-y_n)^2}{2\beta}, & |\pred{y}_n-y_n|<\beta,\\[4pt]
+|\pred{y}_n-y_n|-\dfrac{\beta}{2}, & \text{otherwise,}
+\end{cases}
+\qquad \beta=1 .
+\label{eq:lum-huber}
+\end{align}
+With the default \code{loss\_type: mse}, \eqref{eq:lum-total} is exactly the generic
+supervised term \eqref{eq:sup} restricted to the four predicted channels --- nothing more.
+Note that \eqref{eq:lum-rmse}, despite its name, takes the square root \emph{element-wise
+before} averaging, so it is an $\epsilon$-smoothed MAE, not
+$\sqrt{\langle(\pred{y}-y)^2\rangle}$; the two differ by Jensen's inequality and have
+different gradients.
+
+\paragraph{No cost, no KCL, no thermal term.} A \code{grep} for \code{cost} over
+\code{losses.py} and \code{trainer.py} returns nothing: the cost coefficients
+$c_2,c_1,c_0$ occupy generator input columns 8--10 and are read only by the evaluator
+helper \code{extract\_generation\_costs\_from\_batch}. The solver's optimal objective is
+stored in the dataset (\code{objective} field, \code{docs/opfdata\_schema.md:263}) and is
+not used in training. So cost reaches the parameters exactly as in GridFM --- only through
+the labels $P^\star_g$ --- and \eqref{eq:kcl-p}--\eqref{eq:kcl-q}, \eqref{eq:therm} and
+\eqref{eq:ang} have no gradient path whatsoever.
+
+\subsection{The physics-informed loss is a skeleton}
+
+\code{PhysicsInformedLoss} (\code{losses.py:267--348}) subclasses the above and adds
+\begin{equation}
+L_{\mathrm{PI}} = L_{\mathrm{LUMINA}} + w_{\mathrm{phys}}\,\mathcal{P},
+\qquad
+\mathcal{P}=\sum_{c\,\in\,\mathcal{C}} \pi\big(v_c(\pred{x})\big),
+\qquad
+\mathcal{C}\subseteq\{\text{power\_flow},\text{line\_limits}\},
+\label{eq:lum-pi}
+\end{equation}
+with three selectable penalty forms (\code{losses.py:324--334})
+\begin{equation}
+\pi_{\mathrm{quad}}(v)=\big\langle v^2\big\rangle,
+\qquad
+\pi_{\mathrm{abs}}(v)=\big\langle |v|\big\rangle,
+\qquad
+\pi_{\mathrm{barrier}}(v)=-\big\langle \log\max(-v,\epsilon)\big\rangle .
+\label{eq:lum-penalty}
+\end{equation}
+But $v_c$ is supplied by an injected \code{constraint\_computer} that defaults to
+\code{None}, in which case \code{\_compute\_physics\_penalty} returns the constant $0$
+(\code{losses.py:314--316}); \code{set\_constraint\_computer} is never called anywhere in
+the SDK, the examples, or the tests, and the trainer instantiates \code{OPFLossManager}
+(hence \code{ACOPFLossFunction}), never \code{PhysicsInformedLoss}
+(\code{trainer.py:1689, 2335}). Both the README and the changelog call it a ``skeleton''.
+Therefore $\mathcal{P}\equiv 0$ and \eqref{eq:lum-pi} collapses to \eqref{eq:lum-total} in
+every shipped code path.
+
+\subsection{The augmented Lagrangian was removed before release}
+
+The generic augmented-Lagrangian objective, with $h$ the equality residual (power balance)
+and $g$ the inequality residual, is
+\begin{equation}
+L_{\mathrm{AL}}
+= L_{\mathrm{sup}}(\pred{x},x^\star)
+\;+\;\lambda^\top h(\pred{x})
+\;+\;\frac{\rho}{2}\big\|h(\pred{x})\big\|^2
+\;+\;\mu^\top \relu\!\big(g(\pred{x})\big)
+\;+\;\frac{\rho}{2}\big\|\relu\!\big(g(\pred{x})\big)\big\|^{2} ,
+\label{eq:lum-al}
+\end{equation}
+with $(\lambda,\mu,\rho)$ updated on a slower schedule than $\phi$, e.g.
+$\lambda\leftarrow\lambda+\rho\,h(\pred{x})$. Its distinction from \eqref{eq:kkt} is
+structural: in IPOPT, $\lambda$ and $\mu$ are unknowns solved \emph{jointly with} $x$ for
+\emph{each instance} and certify optimality at convergence; in \eqref{eq:lum-al} they are
+training-time hyper-state shared \emph{across} instances, shaping $\phi$ so that predictions
+tend to have small violations, and nothing in \eqref{eq:lum-al} is evaluated at inference.
+
+\eqref{eq:lum-al} is included here for contrast only. It is \textbf{not} the released
+objective: the SDK changelog records, under \code{[Unreleased]} $\to$ \emph{Changed},
+``\emph{Removed unreleased Lagrangian settings from Frontier-facing configs and removed
+Lagrangian loss options from the Frontier training CLI}'' (\code{CHANGELOG.md:17}), and a
+\code{grep -i lagrang} over the entire SDK matches that changelog line and nothing else ---
+no loss class, no config key, no CLI flag. The Lagrangian variants studied in the papers
+are thus not reproducible from the public SDK, and the claim that LUMINA's thermal and
+angle inequalities are ``handled in the augmented-Lagrangian term'' cannot be supported by
+any released artefact.
+
+\subsection{Constraints appear only as evaluation metrics --- and only the box ones}
+
+\code{ACOPFConstraintEvaluator} (\code{evaluator/opf/evaluator.py:194--373}) computes, with
+no gradient path,
+\begin{align}
+\mathcal{V}_V &= \Big\langle \relu\!\big(V^{\min}_i-\pred{V}_i\big)+\relu\!\big(\pred{V}_i-V^{\max}_i\big)\Big\rangle_i,
+\label{eq:lum-viol-v}\\
+\mathcal{V}_{P} &= \Big\langle \relu\!\big(P^{\min}_g-\pred{P}_g\big)+\relu\!\big(\pred{P}_g-P^{\max}_g\big)\Big\rangle_g,
+\qquad
+\mathcal{V}_{Q}\ \text{analogously},
+\label{eq:lum-viol-pq}\\
+\mathcal{V}_{\mathrm{total}} &= \mathcal{V}_V+\mathcal{V}_P+\mathcal{V}_Q .
+\label{eq:lum-viol-tot}
+\end{align}
+\code{evaluate\_all\_constraints} delegates \emph{only} to these bound checks; its
+docstring states that ``power-flow and line-flow evaluations are planned but not yet
+active'', and the aggregation of \code{real\_power\_flow\_violations},
+\code{reactive\_power\_flow\_violations} and \code{line\_flow\_violations} into a total is
+commented out (\code{evaluator.py:404--408}). So the KCL and thermal violations that
+\eqref{eq:sfm-kcl} and \eqref{eq:sfm-thermlim} penalise in GridSFM are, in LUMINA, neither
+trained nor measured.
+
+There is a further subtlety worth noting: under the default
+\code{minmax\_scaling=True}, \eqref{eq:lum-v}--\eqref{eq:lum-q} make
+\eqref{eq:lum-viol-v}--\eqref{eq:lum-viol-pq} identically zero by construction. The only
+violation metric the SDK reports is therefore the one the architecture already guarantees,
+and a reported $\mathcal{V}_{\mathrm{total}}=0$ is evidence about the output layer, not
+about feasibility of the operating point.
+
+\paragraph{Model selection does not see constraints either.} The checkpoint monitor is
+\code{val/score} (\code{configs/config.yaml:44}), and
+\begin{equation}
+\texttt{val/score} \;=\; \texttt{val/loss/objective} \;=\; L_{\mathrm{LUMINA}}
+\label{eq:lum-score}
+\end{equation}
+exactly (\code{trainer.py:1334--1340}). The config keys \code{score\_alpha},
+\code{log\_normalized\_violation}, \code{violation\_eval\_p} are parsed and stored, and the
+sub-sampled ``violation evaluation'' pass (\code{trainer.py:1854--1960}) in fact recomputes
+only the regression loss; no violation term is folded into the score. Best-model selection
+is therefore purely regression-driven.
+
+\subsection{Implementation notes observed while tracing the SDK}
+
+These are incidental to the formulas but affect whether the code above runs as written, on
+\code{main} at \code{f78cfae}:
+\begin{enumerate}
+\item \code{trainer.py:1692} (and \code{2338}) construct
+      \code{OPFLossManager(loss\_type=..., device=..., log\_normalized\_violation=...)}.
+      \code{OPFLossManager} forwards \code{**kwargs} to \code{ACOPFLossFunction}
+      (\code{losses.py:377}), whose \code{\_\_init\_\_} accepts only
+      \code{loss\_type, node\_weights, reduction, epsilon, beta} and no \code{**kwargs}
+      (\code{losses.py:108--115}) --- so this raises
+      \code{TypeError: \_\_init\_\_() got an unexpected keyword argument
+      'log\_normalized\_violation'} at trainer construction. Verified statically from the
+      AST; not executed here (no \code{torch} in this environment).
+\item \code{create\_combined\_loss} and \code{create\_robust\_loss}
+      (\code{losses.py:535--562}) pass \code{loss\_type} as a \emph{dict}
+      (e.g.\ \code{\{'mse': 0.7, 'smooth\_l1': 0.3\}}), which fails the
+      \code{loss\_type not in valid\_types} check at \code{losses.py:125}. The advertised
+      weighted-combination loss is therefore unreachable; \eqref{eq:lum-total} admits one
+      $\ell$ at a time.
+\item \code{ACOPFLossFunction.compute\_loss} (\code{losses.py:219--230}) computes
+      \code{masked\_predictions}/\code{masked\_targets} and then calls
+      \code{self.forward(predictions, targets)} with the \emph{unmasked} pair. The
+      \code{y\_mask} path is dead in that method (\code{OPFLossManager.compute\_loss}
+      does use the masked pair).
+\end{enumerate}
+None of these change \eqref{eq:lum-total}; items 1 and 2 mean the published
+\code{main} needs a patch before the documented training commands run.
+
+% ======================================================================
+\section{Side-by-side summary}
+
+\renewcommand{\arraystretch}{1.25}
+\begin{longtable}{@{}p{0.20\textwidth}p{0.25\textwidth}p{0.25\textwidth}p{0.22\textwidth}@{}}
+\toprule
+\textbf{OPF element} & \textbf{GridFM} & \textbf{GridSFM} & \textbf{LUMINA} (SDK)\\
+\midrule
+\endhead
+Predicts & $V_m,V_a,P_g$; $Q_g$ \emph{derived} from Q-balance \eqref{eq:gridfm-qg}
+         & $\theta,V,P_g,Q_g$, flows, feasibility logit
+         & $V_a,V_m,P_g,Q_g$ \\
+KCL equality
+         & layered residual penalty \eqref{eq:gridfm-layered}; \code{PBE} \eqref{eq:gridfm-pbe}; exact in $Q$ at PV/REF
+         & capacity-normalised worst-bus-tilted penalty \eqref{eq:sfm-kcl}
+         & \textbf{no} term; not even evaluated \\
+$V$ bounds
+         & \textbf{hard} sigmoid \eqref{eq:gridfm-vbound} (OPF only)
+         & \textbf{hard} leaky clip \eqref{eq:sfm-v} ($\alpha{=}0$)
+         & \textbf{hard} sigmoid \eqref{eq:lum-v} \\
+$P_g$ bounds
+         & \textbf{hard} sigmoid \eqref{eq:gridfm-pbound} (OPF only)
+         & \textbf{hard} leaky clip \eqref{eq:sfm-pg}
+         & \textbf{hard} sigmoid \eqref{eq:lum-p} \\
+$Q_g$ bounds
+         & soft hinge over violators \eqref{eq:gridfm-qviol}, weight $10^{-3}$
+         & \textbf{hard} leaky clip \eqref{eq:sfm-qg}
+         & \textbf{hard} sigmoid \eqref{eq:lum-q} \\
+Thermal limit
+         & evaluation only (\code{test\_step})
+         & soft top-$k$ barrier \eqref{eq:sfm-thermlim} ($\lambda{=}5$) + supervised loading \eqref{eq:sfm-loading}
+         & \textbf{no} term; ``planned, not yet active'' in evaluator \\
+Angle limit
+         & evaluation only
+         & pooled stress statistic \eqref{eq:sfm-stress-a} inside \eqref{eq:sfm-stress}
+         & \textbf{no} term; $\theta$ head unscaled \\
+Generation cost
+         & \textbf{no} loss term; optimality gap \eqref{eq:gridfm-gap} at test time
+         & explicit log-cost \emph{matching} \eqref{eq:sfm-cost} + dispatch imitation
+         & \textbf{no} term; $c_0,c_1,c_2$ inputs unused in training \\
+Feasibility
+         & --- & BCE head \eqref{eq:sfm-feas} + synthetic infeasible samples & --- \\
+KKT solve at inference & no & no & no \\
+Objective & \eqref{eq:gridfm-instance} & \eqref{eq:sfm-total} & \eqref{eq:lum-total}: one of MSE / MAE / RMSE / MAPE / Huber \\
+Warm start to exact solver & possible & demonstrated (PowerModels/IPOPT) & possible in principle \\
+\bottomrule
+\end{longtable}
+
+% ======================================================================
+\section{Reading of the whole picture}
+
+Classical OPF solves one optimisation problem per sample. These three solve many offline,
+then fit \eqref{eq:map} to the solutions, and answer in one forward pass. Their training
+signals decompose into six pedagogically distinct instructions, and the strength of each is
+what the formulas above make precise:
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{0.30\textwidth}p{0.20\textwidth}p{0.42\textwidth}@{}}
+\toprule
+Mechanism & Strength & Formula \\
+\midrule
+``be close to the solver solution'' & soft, but the anchor of everything
+  & \eqref{eq:gridfm-masked}, \eqref{eq:sfm-Ltheta}--\eqref{eq:sfm-Lqg}, \eqref{eq:lum-total} \\
+``reduce the power-balance mismatch'' & soft
+  & \eqref{eq:gridfm-layered}, \eqref{eq:gridfm-pbe}, \eqref{eq:sfm-kcl} \\
+``never leave this interval'' & \textbf{hard} (architectural)
+  & \eqref{eq:gridfm-vbound}--\eqref{eq:gridfm-pbound}, \eqref{eq:sfm-pg}--\eqref{eq:sfm-v}, \eqref{eq:lum-v}--\eqref{eq:lum-q} \\
+``do not overload a line'' & soft
+  & \eqref{eq:sfm-thermlim} \\
+``match the optimal cost'' & soft, two-sided
+  & \eqref{eq:sfm-cost} \\
+``recognise an infeasible instance'' & classification
+  & \eqref{eq:sfm-feas} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three conclusions follow directly from the formulas rather than from intuition.
+
+\textbf{First}, only constraints realised as output transformations are guaranteed:
+\eqref{eq:vlim} and \eqref{eq:glim} in GridSFM and in LUMINA-with-scaling, and
+\eqref{eq:vlim} plus the $P_g$ box in GridFM's OPF task. Everything else --- KCL, thermal,
+angle --- is a penalty and can be violated at inference by an amount no term in
+\eqref{eq:sfm-total} bounds a priori.
+
+\textbf{Second}, ``minimising generation cost'' means something different in each model.
+GridFM has no cost gradient at all: cost enters exclusively through the labels
+\eqref{eq:gridfm-masked}, and \eqref{eq:gridfm-gap} is a report card. GridSFM has a cost
+gradient, but it is a \emph{matching} gradient \eqref{eq:sfm-cost} that is equally unhappy
+about a cheaper-than-optimal dispatch --- which is the correct design, since an
+unconstrained $\min\pred{C}$ under a soft KCL penalty has the degenerate solution
+$\pred{P}_g\to P^{\min}_g$. Neither model performs a descent on \eqref{eq:opf-obj} subject
+to \eqref{eq:kcl-p}--\eqref{eq:ang} at inference.
+
+\textbf{Third}, the three models occupy three distinct rungs of constraint awareness, and
+the gap is larger than the papers suggest. GridSFM penalises every family
+\eqref{eq:sfm-total} and matches the cost \eqref{eq:sfm-cost}. GridFM penalises power
+balance \eqref{eq:gridfm-layered} and the reactive limits \eqref{eq:gridfm-qviol}, and
+evaluates the rest. The released LUMINA objective \eqref{eq:lum-total} is a single
+regression loss over four channels: its only constraint mechanism is the sigmoid box
+\eqref{eq:lum-v}--\eqref{eq:lum-q}, the physics penalty \eqref{eq:lum-pi} is a skeleton
+whose penalty term is identically zero, the Lagrangian options were removed before release
+(\code{CHANGELOG.md:17}), and even the evaluator measures only the box constraints the
+output layer already guarantees. So when comparing feasibility metrics across the three,
+note that they are not three implementations of the same idea: GridSFM is trained against
+the violations, GridFM against some of them, and LUMINA against none. Accordingly,
+\eqref{eq:lum-al} should be cited as a contrast case or as paper-reported behaviour, never
+as a property of the released checkpoint or SDK.
+
+\end{document}

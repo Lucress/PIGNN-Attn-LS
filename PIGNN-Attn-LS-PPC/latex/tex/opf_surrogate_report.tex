@@ -9,17 +9,19 @@
 \usepackage{float}
 
 \title{AC-OPF Surrogates: GridFM, GridSFM, and LUMINA\\
-\large Two data pipelines, two training objectives, six grids}
+\large Two data pipelines, two training objectives, four surrogates}
 \author{PIGNN-Attn-LS-PPC experimental summary}
-\date{8 August 2026}
+\date{12 August 2026}
 
 \begin{document}
 \maketitle
 
 \section{Scope}
-This report compares three power-system OPF surrogates across \textbf{two
+This report compares power-system OPF surrogates across \textbf{two
 independently constructed data pipelines} and, on OPFData, \textbf{two training
-objectives}.
+objectives}. Three are released foundation models (GridFM, GridSFM, LUMINA);
+a fourth, this project's own PIGNN solver, is added on OPFData
+(Section~\ref{sec:pignn}) as a far smaller physics-structured alternative.
 
 \paragraph{What the three models are --- they are not alike.} LUMINA and GridSFM
 are \emph{released foundation models} with public checkpoints, evaluated here
@@ -680,6 +682,79 @@ version applied the per-unit bus bases a second time --- the parquet loader has
 already applied them --- and missed the Y-bus by a relative \(7.5\times10^{2}\)
 without raising anything.
 
+\section{PIGNN as an OPF surrogate}
+\label{sec:pignn}
+
+The project's own solver --- unrolled Newton with edge self-attention and an
+Armijo line search --- was adapted for OPF
+(\texttt{GNSMsg\_SelfAttention\_armijo\_opf.py}) and trained on OPFData with
+the same loaders and metrics. It is a different kind of model from the other
+three: 17{,}272 parameters against 2.4--20~M, and its iteration count \(K\) is
+an explicit compute knob.
+
+The adaptation is not a loss swap. The power-flow solver derives two things
+from one \texttt{bus\_type} vector --- which equations are enforced, and which
+state variables may move --- and OPF separates them. The dispatch at a
+controllable bus is a decision, so a residual there is the optimiser
+redispatching, not an error; but the voltage profile at that same bus is
+exactly what the optimiser chooses, so it must stay free. Freezing it (which
+reusing the PF masking would do) is wrong. The Armijo merit function uses the
+masked mismatch for the same reason.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrrrr}
+\toprule
+Grid & Run & RMSE & \(|V|\) & \(\theta\) [deg] & \(\overline{|\Delta P|}\) & p95\(|\Delta P|\) & cost gap \\
+\midrule
+case14 & PIGNN \(K{=}10\) & 9.620e-3 & 1.40e-3 & 0.545 & 3.862e-3 & 1.093e-2 & 8.99\% \\
+       & PIGNN \(K{=}30\) & 1.291e-2 & 5.35e-3 & 0.673 & 1.005e-2 & 4.530e-2 & 12.30\% \\
+\midrule
+case118 & PIGNN \(K{=}10\)$^{\dagger}$ & 2.092e-1 & 2.62e-2 & 11.890 & 2.819e-1 & 6.645e-1 & \(-53.98\%\) \\
+        & PIGNN \(K{=}30\)$^{\dagger}$ & 2.473e-1 & 3.39e-2 & 14.037 & 2.428e-1 & 6.645e-1 & \(-65.04\%\) \\
+\bottomrule
+\end{tabular}
+\caption{PIGNN on OPFData, native to this project (there is no external
+reference implementation to compare against). $^{\dagger}$frozen: the training
+loss is bit-identical from epoch 7 (\(K{=}10\), 4.8127e-02) and epoch 9
+(\(K{=}30\), 7.2435e-02), so these two are not measurements of capability.}
+\end{table}
+
+\paragraph{Competitive on case14, does not train on case118.} At \(K{=}10\)
+PIGNN reaches 9.620e-3 on case14 --- between LUMINA (7.68e-3) and GridSFM
+scratch (3.11e-2) under the shared objective, and within a factor of two of
+LUMINA --- with \(\overline{|\Delta P|}=3.9\times10^{-3}\), comparable to the
+mirror GridFM's 3.963e-3. For a 17{,}272-parameter model against 2.4--20~M that
+is a favourable trade, and it is the result most worth following up.
+
+Both case118 runs froze. Their \(|V|\) RMSE of 2.62e-2 and 3.39e-2 is
+the same magnitude as the collapsed GridSFM runs, and \(K{=}30\) lands on
+\textbf{exactly 3.3899e-02} --- the identical value three GridSFM runs
+collapsed to (Section~\ref{sec:gridsfm}). Four runs from two unrelated
+architectures converging on one number is not coincidence: it is what a
+constant magnitude prediction scores on this dataset, i.e.\ the spread of the
+case118 \(|V|\) targets about their mean. \textbf{case118 has a degenerate
+solution that several different models fall into}, which is a property of the
+data and the objective rather than of any one architecture, and it deserves
+investigation before more capacity is spent on that grid.
+
+\paragraph{More unrolled iterations did not help.} \(K{=}30\) is worse than
+\(K{=}10\) on case14 (1.291e-2 vs 9.620e-3) and takes 2.8\(\times\) the wall
+clock (5\,h\,55\,m vs 2\,h\,07\,m). The extra iterations deepen the unrolled
+graph without adding supervision, so the additional compute buys nothing here.
+
+\paragraph{One bug, caught by the training curve rather than the metric.} The
+first four PIGNN runs reported RMSE 2.18e-1 on case14, which would have read as
+``PIGNN is poor at OPF''. The training loss was flat from epoch 7, which is not
+what a merely-weak model looks like. The cause was that OPFData codes
+\texttt{bus\_type} as MATPOWER (1=PQ, 2=PV, 3=ref) while the PPC branch-row
+schema uses 1=slack; the adapted solver had inherited the PF convention and so
+froze the angle at every PQ bus --- 9 of 14 on case14. The reference mask is now
+a required argument that raises if omitted, because it is not safely guessable
+from \texttt{bus\_type} alone. Those runs are archived as
+\texttt{\_SUPERSEDED\_ref\_mask\_bug}.
+
 \section{Cross-pipeline comparison}
 \label{sec:cross}
 
@@ -969,7 +1044,12 @@ about GridSFM should be drawn from these three runs in the meantime.
 
 \paragraph{Completeness.} A further 4 OPFData runs cover the released
 \texttt{gridfm\_graphkit} model (2 grids \(\times\) 2 objectives,
-Section~\ref{sec:graphkit}); all completed. All 20 earlier OPFData runs are
+Section~\ref{sec:graphkit}), and 4 more cover the PIGNN solver (2 grids
+\(\times\) \(K \in \{10,30\}\), Section~\ref{sec:pignn}); all completed,
+though both PIGNN case118 runs froze and are not capability measurements. An
+earlier set of 4 PIGNN runs was discarded to
+\texttt{\_SUPERSEDED\_ref\_mask\_bug} after the angle datum was found to be
+taken from the wrong \texttt{bus\_type} code. All 20 earlier OPFData runs are
 complete: 10 under the shared
 objective and 10 under the native objectives, the latter run twice (alex and
 helma). On the pandapower pipeline the corrected-conversion (\texttt{injbox})
@@ -1012,6 +1092,14 @@ and both initialisations. Progressing it needs a more robust backend
 to the models; thermal violation is consequently not among the scored metrics and
 all three models lack the feature equally. OPFData was run without topological
 perturbations, so N-1 robustness is untested even though the dataset supports it.
+
+\paragraph{case118 has a degenerate attractor.} Three GridSFM runs and one
+PIGNN run, from unrelated architectures, land on a \(|V|\) RMSE of exactly
+3.3899e-02 with a frozen loss. That is what predicting a constant magnitude
+scores on this grid. Whatever admits that solution is a property of the case118
+data and objective rather than of any one model, and it should be diagnosed
+before more capacity is spent there --- it currently invalidates more runs than
+any other single cause in this study.
 
 \paragraph{The main open item.} Every number here comes from voltage-only
 supervision. Both pipelines also carry the optimal dispatch and the objective,

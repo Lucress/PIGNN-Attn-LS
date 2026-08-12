@@ -1,0 +1,318 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers}{natbib}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{longtable}
+
+\definecolor{good}{RGB}{0,128,0}
+\definecolor{warn}{RGB}{200,120,0}
+\definecolor{bad}{RGB}{200,0,0}
+\definecolor{running}{RGB}{0,80,180}
+
+\newcommand{\statusok}[1]{\textcolor{good}{\textbf{#1}}}
+\newcommand{\statuswarn}[1]{\textcolor{warn}{\textbf{#1}}}
+\newcommand{\statusbad}[1]{\textcolor{bad}{\textbf{#1}}}
+\newcommand{\statusrun}[1]{\textcolor{running}{\textbf{#1}}}
+
+\title{Phase~0 Backbone Dataset Generation Report\\
+\large PIGNN-Attn-LS --- PPC Benchmark Grids}
+
+\author{Changhun Kim}
+\date{June 24, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the Phase~0 backbone data-generation campaign for the
+PIGNN-Attn-LS Newton--Raphson AC power-flow surrogate across 28~PPC benchmark
+grids plus the ENTSO-E RealGridTest case.
+The backbone preset applies $\pm40\%$ global load scaling, per-bus P/Q/gen
+jitter, PV setpoint variation, and randomised initial voltages---but no
+topology or admittance perturbation (fixed Y-bus, \texttt{share\_grid=True}).
+Round~1 results are reported together with a diagnosis of failures and the
+corrective Round~2 resubmission plan.
+\end{abstract}
+
+
+% ===================================================================
+\section{Experimental Setup}
+% ===================================================================
+
+\subsection{Backbone Preset Parameters}
+
+All grids were generated with \texttt{--scenario\_level backbone}, which sets:
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Global load scale range & $[0.60,\; 1.40]$ \\
+Scale generators with load & Yes \\
+Per-bus load P jitter ($\sigma$) & 0.10 \\
+Per-bus load Q jitter ($\sigma$) & 0.15 \\
+Per-bus gen jitter ($\sigma$) & 0.05 \\
+PV voltage setpoint range & $[0.95,\; 1.05]$\,pu \\
+Random initial voltage & Yes \\
+Initial angle jitter & $5^{\circ}$ \\
+Initial magnitude jitter (PQ) & 0.02\,pu \\
+Line outage probability & 0.0 (topology OFF) \\
+Admittance jitter ($\sigma$) & 0.0 (Y-bus fixed) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each grid targets 36{,}000 rows (19 chunks $\times$ 1{,}900 + 1 $\times$ 1{,}800
+for array jobs; single batch for small grids).  Non-converged samples are
+dropped via \texttt{--drop\_nonconverged}.  The Newton--Raphson solver uses
+$K{=}40$ maximum iterations with mismatch-infinity convergence checking.
+
+\subsection{Cluster Environment}
+
+Jobs ran on the FAU Fritz HPC cluster (Intel Xeon, 72 cores per node),
+partition \texttt{singlenode}, with 24-hour wall time.  Conda environment
+\texttt{Python3.12\_PandaPower3.4.0}. Output parquets are stored on
+the \texttt{/home/vault} filesystem.
+
+
+% ===================================================================
+\section{Round~1 Results (June 22--24, 2026)}
+\label{sec:round1}
+% ===================================================================
+
+\subsection{Single-Node PPC Grids (24 Jobs)}
+
+\begin{longtable}{l r r r l l}
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{Rows} & \textbf{Conv.\%} & \textbf{Status} & \textbf{Notes} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{Rows} & \textbf{Conv.\%} & \textbf{Status} & \textbf{Notes} \\
+\midrule
+\endhead
+case4gs       & 4    & 36{,}000 & 100.0 & \statusok{OK} & \\
+case5         & 5    & 36{,}000 & 100.0 & \statusok{OK} & \\
+case6ww       & 6    & 36{,}000 & 100.0 & \statusok{OK} & \\
+case9         & 9    & 36{,}000 & 100.0 & \statusok{OK} & \\
+case14        & 14   & 36{,}000 & 100.0 & \statusok{OK} & \\
+case24\_ieee\_rts & 24 & 36{,}000 & 100.0 & \statusok{OK} & \\
+case30        & 30   & 36{,}000 & 100.0 & \statusok{OK} & \\
+case\_ieee30  & 30   & 36{,}000 & 100.0 & \statusok{OK} & \\
+case33bw      & 33   & 688      & 1.9   & \statusbad{Low conv.} & Radial grid \\
+case39        & 39   & 36{,}000 & 100.0 & \statusok{OK} & \\
+case57        & 57   & 33{,}757 & 93.8  & \statusok{OK} & Minor trimming \\
+case89pegase  & 89   & 1{,}536  & 4.3   & \statusbad{Low conv.} & PEGASE sensitive \\
+case118       & 118  & 36{,}000 & 100.0 & \statusok{OK} & \\
+case145       & 145  & 3{,}202  & 8.9   & \statusbad{Low conv.} & \\
+case\_illinois200 & 200 & 117   & 0.3   & \statusbad{Low conv.} & Near-zero \\
+case300       & 300  & 15{,}219 & 42.3  & \statuswarn{Partial} & \\
+case1354pegase & 1{,}354 & 0   & ---   & \statusbad{NODE\_FAIL} & Node crash at $\sim$1\,h \\
+case1888rte   & 1{,}888 & 0    & ---   & \statusbad{NODE\_FAIL} & Node crash at $\sim$1\,h \\
+case2848rte   & 2{,}848 & 0    & ---   & \statusbad{TIMEOUT} & Exceeded 24\,h \\
+case2869pegase & 2{,}869 & 0   & ---   & \statusbad{TIMEOUT} & Exceeded 24\,h \\
+case3120sp    & 3{,}120  & 0   & ---   & \statusbad{TIMEOUT} & Exceeded 24\,h \\
+GBnetwork     & 2{,}224  & 0   & ---   & \statusbad{NODE\_FAIL} & Node crash \\
+GBreducednetwork & 29 & 36{,}000 & 100.0 & \statusok{OK} & \\
+iceland       & 189  & 0        & 0.0   & \statusbad{0\% conv.} & All diverged \\
+\midrule
+\multicolumn{2}{l}{\textbf{Successful (36k)}} & \multicolumn{4}{l}{13 grids} \\
+\multicolumn{2}{l}{\textbf{Partial / low conv.}} & \multicolumn{4}{l}{4 grids} \\
+\multicolumn{2}{l}{\textbf{Failed / empty}} & \multicolumn{4}{l}{7 grids} \\
+\bottomrule
+\end{longtable}
+
+
+\subsection{Array Jobs (Large Grids + ENTSO-E)}
+
+\begin{tabular}{l c c l}
+\toprule
+\textbf{Grid} & \textbf{Tasks OK/Total} & \textbf{Status} & \textbf{Issue} \\
+\midrule
+case6470rte   & 11/19 & \statuswarn{Partial} & 8 NODE\_FAIL; merge blocked \\
+case6495rte   & 16/19 & \statuswarn{Partial} & 3 NODE\_FAIL; merge blocked \\
+case6515rte   & 2/19  & \statusrun{Running}  & In progress \\
+case9241pegase & 0/19 & \statusrun{Running}  & In progress \\
+ENTSO-E       & 0/18  & \statusrun{Pending}  & Queued \\
+\bottomrule
+\end{tabular}
+
+
+\subsection{Failure Analysis}
+
+Three distinct failure modes were observed:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{NODE\_FAIL} (case1354pegase, case1888rte, GBnetwork, partial
+  chunks of case6470rte/case6495rte): Fritz compute nodes crashed during
+  execution---an infrastructure issue unrelated to the code.  These grids
+  produced 4-byte empty parquet placeholders.
+
+\item \textbf{TIMEOUT} (case2848rte, case2869pegase, case3120sp): Generating
+  36{,}000 samples on a single node for grids with 2{,}800--3{,}100 buses
+  exceeds the 24-hour wall-time limit.  Each NR solve takes $\sim$2--3\,s per
+  sample at this scale, giving $\sim$20--30\,h for the full 36k.
+
+\item \textbf{Low convergence} (iceland~0\%, case\_illinois200~0.3\%,
+  case33bw~1.9\%, case89pegase~4.3\%, case145~8.9\%, case300~42.3\%):
+  The $\pm40\%$ global load-scaling range pushes these grids far beyond their
+  NR convergence basin.  Contributing factors:
+  \begin{itemize}
+    \item \textbf{case33bw}: Radial (tree) topology---any significant
+      load perturbation causes voltage collapse on long feeders.
+    \item \textbf{iceland}: Likely a weakly-meshed island grid with
+      narrow voltage stability margins.
+    \item \textbf{case89pegase / case145}: PEGASE-family grids model
+      realistic European transmission with tight reactive-power limits.
+    \item \textbf{case\_illinois200}: Known to have a narrow feasible
+      operating region.
+    \item \textbf{case300}: Partial success (42.3\%)---the upper load-scale
+      region ($>1.2\times$) causes most divergences.
+  \end{itemize}
+\end{enumerate}
+
+
+% ===================================================================
+\section{Round~2 Corrective Actions (Submitted June 24, 2026)}
+\label{sec:round2}
+% ===================================================================
+
+\subsection{Medium-Large Grids: Converted to Array Jobs}
+
+Five grids that failed as single-node jobs (NODE\_FAIL or TIMEOUT) are
+resubmitted as 19-chunk Slurm array jobs, matching the pattern used for the
+6{,}000+ bus grids:
+
+\begin{center}
+\begin{tabular}{l c l}
+\toprule
+\textbf{Grid} & \textbf{Buses} & \textbf{Round~1 Failure} \\
+\midrule
+case1354pegase & 1{,}354 & NODE\_FAIL \\
+case1888rte    & 1{,}888 & NODE\_FAIL \\
+case2848rte    & 2{,}848 & TIMEOUT \\
+case2869pegase & 2{,}869 & TIMEOUT \\
+case3120sp     & 3{,}120 & TIMEOUT \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each array task generates $\sim$1{,}900 samples with 24 workers; total 36{,}000
+per grid. An \texttt{afterok}-dependent merge job stitches chunks into the final
+parquet.
+
+\textbf{GBnetwork} (2{,}224 buses) is resubmitted as a single-node job---it
+failed due to NODE\_FAIL (not timeout), so the original configuration is
+retained.
+
+
+\subsection{Low-Convergence Grids: Narrowed Load Range ($\pm20\%$)}
+
+Six grids with convergence rates below 50\% are resubmitted with a narrower
+global load-scaling range of $[0.80,\; 1.20]$ (down from $[0.60,\; 1.40]$):
+
+\begin{center}
+\begin{tabular}{l r r l}
+\toprule
+\textbf{Grid} & \textbf{Round~1 Rows} & \textbf{Round~1 Conv.\%} & \textbf{Round~2 Action} \\
+\midrule
+iceland          & 0        & 0.0\%  & $\pm20\%$ range \\
+case\_illinois200 & 117     & 0.3\%  & $\pm20\%$ range \\
+case89pegase     & 1{,}536  & 4.3\%  & $\pm20\%$ range \\
+case33bw         & 688      & 1.9\%  & $\pm20\%$ range \\
+case145          & 3{,}202  & 8.9\%  & $\pm20\%$ range \\
+case300          & 15{,}219 & 42.3\% & $\pm20\%$ range \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+If $\pm20\%$ still produces unacceptable convergence rates, a further
+narrowing to $\pm10\%$ will be applied for the most fragile grids
+(case33bw, iceland, case\_illinois200).
+
+
+\subsection{Partial Array Chunks: Manual Merge}
+
+For case6470rte (11/19 completed) and case6495rte ($\geq$16/19 completed),
+empty 4-byte chunk parquets from NODE\_FAIL tasks were deleted.
+The available chunks can be merged into partial datasets ($\sim$21k and
+$\sim$30k rows respectively) or the failed chunks resubmitted individually.
+
+
+% ===================================================================
+\section{Next Steps}
+\label{sec:next}
+% ===================================================================
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Monitor Round~2 completion.}
+  Wait for all Round~2 jobs to finish, then audit convergence rates for the
+  narrowed-range grids and row counts for the newly-arrayed medium-large grids.
+
+\item \textbf{Per-grid convergence analysis.}
+  After all data lands, compile a per-grid convergence-rate table.
+  For grids still below $\sim$80\% convergence at $\pm20\%$, further narrow
+  to $\pm10\%$ or consider dropping them from the Phase~0 benchmark set.
+
+\item \textbf{Merge all partial array datasets.}
+  Run the merge script for case6470rte, case6495rte, case6515rte,
+  case9241pegase once their array tasks stabilise.  Decide whether to
+  accept partial row counts or resubmit failed chunks.
+
+\item \textbf{ENTSO-E RealGridTest.}
+  The ENTSO-E array job is queued and uses \texttt{--label\_solver
+  pandapower\_nr}. Monitor separately---this is the only non-PPC
+  backbone grid in the campaign.
+
+\item \textbf{Phase~0 training sweep.}
+  Once all backbone parquets are complete, launch the Phase~0 training
+  campaign across all grids with the PIGNN-Attn-LS model.
+  Key metrics: RMSE on voltage magnitude and angle, physics-loss
+  (power mismatch), and generalisation to unseen load scenarios.
+
+\item \textbf{Phase~1 planning: Topology perturbation.}
+  With Phase~0 baselines established, design the Phase~1 topology
+  perturbation experiments:
+  \begin{itemize}
+    \item Select small/medium grids ($\leq$300 buses) for
+      \texttt{share\_grid=False} line-outage experiments.
+    \item Use the ratio-mode contingency sampler (55/27/18 N-0/N-1/N-2 mix).
+    \item Compare attention-head activation patterns between
+      fixed-topology (Phase~0) and variable-topology (Phase~1) models.
+  \end{itemize}
+\end{enumerate}
+
+
+% ===================================================================
+\section{Summary}
+% ===================================================================
+
+Phase~0 Round~1 achieved full 36{,}000-row datasets for 13 of 24 single-node
+grids.  Seven grids failed due to infrastructure issues (NODE\_FAIL, TIMEOUT)
+and are being resubmitted as array jobs.  Six grids showed low NR convergence
+at the $\pm40\%$ load range and are being regenerated with a $\pm20\%$ range.
+Four large array jobs (case6515rte, case9241pegase, ENTSO-E, and partial
+case6470rte/case6495rte) are still running or pending.
+
+Once Round~2 completes, the Phase~0 backbone dataset is expected to cover all
+28 PPC benchmark grids plus ENTSO-E RealGridTest, providing the training data
+foundation for the PIGNN-Attn-LS Newton--Raphson surrogate.
+
+\end{document}

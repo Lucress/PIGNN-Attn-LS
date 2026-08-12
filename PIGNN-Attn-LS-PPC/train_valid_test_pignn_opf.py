@@ -280,6 +280,9 @@ def run():
                     Is_trafo=br["Is_trafo"].unsqueeze(0),
                     Y=Y, S=S_load, V0=V0,
                     ctrl_mask=ctrl.reshape(1, -1),
+                    # OPFData follows MATPOWER: 1=PQ, 2=PV, 3=ref
+                    # (see opfdata_pipeline.to_gridfm_inputs).
+                    ref_mask=(bus_type == 3),
                     n_nodes_per_graph=batch["sizes"].to(device),
                     v_min=(vmin.reshape(1, -1).float() if vmin is not None else None),
                     v_max=(vmax.reshape(1, -1).float() if vmax is not None else None),

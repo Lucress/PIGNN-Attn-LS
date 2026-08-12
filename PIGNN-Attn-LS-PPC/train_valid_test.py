@@ -16,9 +16,16 @@ from GNSMsg_SelfAttention_armijo_khop import GNSMsg_EdgeSelfAttnKHop
 from GNSMsg_armijo import GNSMsg   # adapt separately if you still want the non-attention baseline
 
 from Dataset_optimized_complex_columns import ChanghunDataset
-from collate_blockdiag_optimized_complex_columns import collate_blockdiag
+from collate_blockdiag_optimized_complex_columns import collate_blockdiag, ybus_matvec
 
 from helper import MultiBucketBatchSampler, make_size_bucketing_loader
+from known_operator_pf import (
+    add_known_operator_args,
+    build_known_operator,
+    known_operator_tag,
+    power_flow_residual_loss,
+)
+from helm_known_operator_pf import PIGNNHELMKOL, add_helm_kol_args
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.makedirs("./results/plots", exist_ok=True)
@@ -124,7 +131,7 @@ parser.add_argument(
     '--model',
     type=str,
     default="GNSMsg_EdgeSelfAttn",
-    help='GNSMsg_EdgeSelfAttn | GNSMsg_EdgeSelfAttnKHop',
+    help='GNSMsg_EdgeSelfAttn | GNSMsg_EdgeSelfAttnKHop | PIGNN_HELM_KOL',
 )
 parser.add_argument("--d", type=int, default=4)
 parser.add_argument("--d_hi", type=int, default=16)
@@ -151,6 +158,34 @@ parser.add_argument("--armijo_min_alpha", type=float, default=0.0625)
 parser.add_argument("--vlimit", action="store_true")
 parser.add_argument('--DthetaMax', type=float, default=0.3)
 parser.add_argument('--DvmFrac', type=float, default=0.1)
+parser.add_argument(
+    "--solver_update_mode",
+    choices=("direct", "physics_preconditioner"),
+    default="direct",
+    help=(
+        "direct uses the historical learned voltage corrections; "
+        "physics_preconditioner makes PIGNN predict positive diagonal scales "
+        "for an author-compatible DPF direction at every solver iteration."
+    ),
+)
+parser.add_argument(
+    "--preconditioner_vm_step", type=float, default=0.003377,
+    help="Base multiplier for the PQ-magnitude DPF direction.",
+)
+parser.add_argument(
+    "--preconditioner_va_step", type=float, default=0.003377,
+    help="Base multiplier for the PV/PQ-angle DPF direction.",
+)
+parser.add_argument("--preconditioner_log_clip", type=float, default=5.0)
+parser.add_argument(
+    "--preconditioner_optimizer",
+    choices=("author_adam", "gd"),
+    default="author_adam",
+    help="DPF base direction; author_adam matches the reference repository.",
+)
+parser.add_argument("--preconditioner_beta1", type=float, default=0.979681)
+parser.add_argument("--preconditioner_beta2", type=float, default=0.963442)
+parser.add_argument("--preconditioner_eps", type=float, default=1e-8)
 parser.add_argument("--physics_loss_form", type=str, default="mse", choices=("mse", "huber", "logcosh"))
 parser.add_argument("--physics_residual_norm", type=str, default="none", choices=("none", "setpoint", "graph"))
 parser.add_argument("--physics_norm_eps", type=float, default=1e-6)
@@ -252,6 +287,8 @@ parser.add_argument(
     default=2,
     help="How many decoded parquet row groups to keep in RAM when --lazy_parquet is enabled",
 )
+add_known_operator_args(parser)
+add_helm_kol_args(parser)
 
 # NEW
 parser.add_argument("--log_to_file", action="store_true", help="Save terminal output to a log file as well")
@@ -365,6 +402,11 @@ run_config_tag = (
     f"_lr{args.LR:g}"
     f"_seed{args.seed_value}"
     f"_valid{args.valid_ratio:g}"
+    f"_{known_operator_tag(args)}"
+    f"_{args.solver_update_mode}"
+    f"_{args.preconditioner_optimizer}"
+    f"_pvm{args.preconditioner_vm_step:g}_pva{args.preconditioner_va_step:g}"
+    f"_helmord{args.helm_series_order}_path{args.helm_path_order}"
 )
 
 
@@ -432,6 +474,9 @@ print(
     f"khop_K:{args.khop_K}, khop_sigma:{args.khop_sigma}, "
     f"khop_norm:{args.khop_norm}, khop_source:{args.khop_source}, "
     f"dataset_complex_dtype:{args.dataset_complex_dtype}"
+    f", known_operator:{known_operator_tag(args)}"
+    f", solver_update_mode:{args.solver_update_mode}"
+    f", preconditioner_optimizer:{args.preconditioner_optimizer}"
 )
 
 
@@ -583,6 +628,14 @@ elif args.model == "GNSMsg_EdgeSelfAttn":
         physics_norm_eps=args.physics_norm_eps,
         physics_huber_delta=args.physics_huber_delta,
         physics_final_weight=args.physics_final_weight,
+        solver_update_mode=args.solver_update_mode,
+        preconditioner_vm_step=args.preconditioner_vm_step,
+        preconditioner_va_step=args.preconditioner_va_step,
+        preconditioner_log_clip=args.preconditioner_log_clip,
+        preconditioner_optimizer=args.preconditioner_optimizer,
+        preconditioner_beta1=args.preconditioner_beta1,
+        preconditioner_beta2=args.preconditioner_beta2,
+        preconditioner_eps=args.preconditioner_eps,
         bus_feat_extra_dim=1 if args.vn_feat else 0,
     ).to(device)
 
@@ -615,8 +668,29 @@ elif args.model == "GNSMsg_EdgeSelfAttnKHop":
         khop_source=args.khop_source,
     ).to(device)
 
+elif args.model == "PIGNN_HELM_KOL":
+    if args.kol_pf_mode != "off":
+        raise ValueError("PIGNN_HELM_KOL cannot be combined with the separate DPF post-operator")
+    model = PIGNNHELMKOL(
+        d_model=d_hi,
+        n_heads=n_heads,
+        num_attn_layers=args.num_attn_layers,
+        series_order=args.helm_series_order,
+        path_order=args.helm_path_order,
+        pade_regularization=args.helm_pade_regularization,
+        linear_regularization=args.helm_linear_regularization,
+        select_best_eval_order=not args.helm_no_best_eval_order,
+        physics_loss_form=args.physics_loss_form,
+        physics_huber_delta=args.physics_huber_delta,
+    ).to(device)
+
 else:
     raise ValueError(f"Unknown model: {args.model}")
+
+known_operator = build_known_operator(args)
+if known_operator is not None:
+    known_operator = known_operator.to(device)
+    print(f"Known-operator layer: {known_operator}")
 
 def init_weights(model, exclude_modules):
     for module in model.modules():
@@ -643,10 +717,13 @@ def init_weights(model, exclude_modules):
 
 exclude_modules = []
 if args.preserve_zero_heads:
-    for attr in ("theta_head", "v_head", "m_head"):
+    for attr in ("theta_head", "v_head", "m_head", "path_head"):
         heads = getattr(model, attr, None)
         if heads is not None:
-            exclude_modules.extend(list(heads.modules()))
+            if isinstance(heads, nn.ModuleList):
+                exclude_modules.extend(list(heads.modules()))
+            else:
+                exclude_modules.extend(list(heads.modules()))
 init_weights(model, exclude_modules)
 
 def count_parameters(model):
@@ -738,6 +815,8 @@ def ensure_dense_y_for_metrics(
     Y_shunt_bus,
 ):
     if Y is not None:
+        if Y.is_sparse:
+            return Y
         return Y.unsqueeze(0) if Y.dim() == 2 else Y
 
     if Y_shunt_bus is None:
@@ -780,7 +859,7 @@ def ensure_dense_y_for_metrics(
 
 
 def compute_power_flow_residual_metrics(Y, Vpred, Sset, bus_type, *, n_nodes_per_graph=None, S_base=None):
-    if Y.dim() == 2:
+    if Y.dim() == 2 and not Y.is_sparse:
         Y = Y.unsqueeze(0)
 
     if Y.is_complex():
@@ -795,7 +874,7 @@ def compute_power_flow_residual_metrics(Y, Vpred, Sset, bus_type, *, n_nodes_per
     Sset = Sset.to(device=Y.device, dtype=complex_dtype)
 
     Vc = v * torch.exp(1j * th)
-    Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)
+    Ic = ybus_matvec(Y, Vc)
     Sc = Vc * Ic.conj()
 
     P_set, Q_set = Sset.real, Sset.imag
@@ -850,8 +929,10 @@ def compute_power_flow_residual_metrics(Y, Vpred, Sset, bus_type, *, n_nodes_per
         S_base = S_base.to(max_dp_pu.device, dtype=max_dp_pu.dtype).reshape(-1)
         if S_base.numel() == 1 and max_dp_pu.numel() != 1:
             S_base = S_base.expand(max_dp_pu.numel())
-        metrics["max_dp_mva"] = max_dp_pu * S_base
-        metrics["max_dq_mva"] = max_dq_pu * S_base
+        # S_base is stored in VA. A per-unit power residual multiplied by
+        # S_base is VA; divide by 1e6 before labelling it MW/MVAr.
+        metrics["max_dp_mva"] = max_dp_pu * S_base / 1e6
+        metrics["max_dq_mva"] = max_dq_pu * S_base / 1e6
 
     return metrics
 
@@ -930,16 +1011,28 @@ def finalize_residual_distribution(dp_values, dq_values, *, tol_pu):
 
 
 def format_residual_distribution_compact(dist):
-    return (
+    text = (
         f"(mean |ΔP| {dist['mean_dp_pu']:.3e}, |ΔQ| {dist['mean_dq_pu']:.3e} pu; "
         f"p95 |ΔP| {dist['p95_dp_pu']:.3e}, |ΔQ| {dist['p95_dq_pu']:.3e} pu; "
         f"tol≤ {dist['frac_dp_below_tol']:.2%} P, {dist['frac_dq_below_tol']:.2%} Q; "
         f"conv {dist.get('convergence_rate', 0.0):.2%}@{dist.get('convergence_tol_pu', 0.0):.0e})"
     )
+    if "kol_certification_rate" in dist:
+        text += (
+            f" KOL F∞ {dist['kol_initial_mean']:.3e}->{dist['kol_final_mean']:.3e}; "
+            f"cert {dist['kol_certification_rate']:.2%}@{dist['kol_tolerance']:.0e}; "
+            f"steps {dist['kol_mean_iterations']:.1f}"
+        )
+    if "helm_mean_selected_order" in dist:
+        text += (
+            f" HELM F∞ mean/max {dist['helm_mean_max_mismatch']:.3e}/"
+            f"{dist['helm_max_mismatch']:.3e}; order {dist['helm_mean_selected_order']:.1f}"
+        )
+    return text
 
 
 def format_residual_distribution_full(dist, *, tol_pu):
-    return (
+    text = (
         f"Residual distribution over PV+PQ/PQ buses (tol={tol_pu:.1e} pu):\n"
         f"  mean   |ΔP| {dist['mean_dp_pu']:.4e} pu | |ΔQ| {dist['mean_dq_pu']:.4e} pu\n"
         f"  median |ΔP| {dist['median_dp_pu']:.4e} pu | |ΔQ| {dist['median_dq_pu']:.4e} pu\n"
@@ -952,6 +1045,20 @@ def format_residual_distribution_full(dist, *, tol_pu):
         f"{dist.get('convergence_rate',0.0):.2%} "
         f"({dist.get('n_converged',0)}/{dist.get('n_cases',0)} cases)"
     )
+    if "kol_certification_rate" in dist:
+        text += (
+            f"\n  KOL correction: mean F_inf {dist['kol_initial_mean']:.4e} -> "
+            f"{dist['kol_final_mean']:.4e} pu; certified "
+            f"{dist['kol_certification_rate']:.2%} at {dist['kol_tolerance']:.1e} pu; "
+            f"mean steps {dist['kol_mean_iterations']:.2f}"
+        )
+    if "helm_mean_selected_order" in dist:
+        text += (
+            f"\n  HELM KOL: mean/max F_inf {dist['helm_mean_max_mismatch']:.4e}/"
+            f"{dist['helm_max_mismatch']:.4e} pu; mean selected Pade order "
+            f"{dist['helm_mean_selected_order']:.2f}"
+        )
+    return text
 
 
 # ------------------------------------------------------------------
@@ -972,6 +1079,12 @@ def run_epoch(loader, *, train: bool, pinn: bool):
     dq_dist_values = []
     n_graphs_total = 0
     n_converged = 0   # per-case: both max|ΔP| and max|ΔQ| < convergence_tol_pu
+    kol_initial_values = []
+    kol_final_values = []
+    kol_converged_values = []
+    kol_iteration_values = []
+    helm_residual_values = []
+    helm_order_values = []
 
     with torch.set_grad_enabled(train):
         for batch in loader:
@@ -1042,17 +1155,35 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                 Branch_y_shunt_from = Branch_y_shunt_from.to(torch.complex64)
                 Branch_y_shunt_to = Branch_y_shunt_to.to(torch.complex64)
                 Y_shunt_bus = Y_shunt_bus.to(torch.complex64)
-                if Y is not None:
-                    Y = Y.to(torch.complex64)
-                Sstart = Sstart.to(torch.complex64)
-                Ustart = Ustart.to(torch.complex64)
-                Vstart = Vstart.float()
-                Vnewton = Vnewton.float()
+                if args.model != "PIGNN_HELM_KOL":
+                    if Y is not None:
+                        Y = Y.to(torch.complex64)
+                    Sstart = Sstart.to(torch.complex64)
+                    Ustart = Ustart.to(torch.complex64)
+                    Vstart = Vstart.float()
+                    Vnewton = Vnewton.float()
                 if vn_log is not None:
                     vn_log = vn_log.float()
 
+            Y_exact = ensure_dense_y_for_metrics(
+                Y_metric,
+                bus_type,
+                Branch_f_bus,
+                Branch_t_bus,
+                Branch_status,
+                Branch_tau_metric,
+                Branch_shift_deg_metric,
+                Branch_y_series_from_metric,
+                Branch_y_series_to_metric,
+                Branch_y_series_ft_metric,
+                Branch_y_shunt_from_metric,
+                Branch_y_shunt_to_metric,
+                Y_shunt_bus_metric,
+            )
+            kol_diag = None
+
             if pinn:
-                Vpred, loss_phys = model(
+                Vraw, loss_phys = model(
                     bus_type,
                     Branch_f_bus, Branch_t_bus, Branch_status,
                     Branch_tau, Branch_shift_deg,
@@ -1066,6 +1197,26 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                     Y_shunt_bus=Y_shunt_bus,
                     vn_log=vn_log,
                 )
+
+                if known_operator is not None:
+                    Vpred, kol_diag = known_operator(
+                        Vraw,
+                        Y_exact,
+                        Sstart_metric,
+                        bus_type,
+                        V_fixed=batch["V_start"].to(device),
+                        sizes=n_nodes_per_graph,
+                        differentiable=train,
+                    )
+                    loss_phys = loss_phys + args.kol_final_physics_weight * power_flow_residual_loss(
+                        Y_exact,
+                        Vpred,
+                        Sstart_metric,
+                        bus_type,
+                        sizes=n_nodes_per_graph,
+                    )
+                else:
+                    Vpred = Vraw
 
                 dmag = (Vpred[..., 0] - Vnewton[..., 0])
                 dang = torch.atan2(
@@ -1085,13 +1236,21 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                     loss = loss_phys + args.mse_weight * mse
                 else:
                     loss = loss_phys
+                if known_operator is not None and args.kol_raw_loss_weight > 0.0:
+                    raw_dmag = Vraw[..., 0] - Vnewton[..., 0]
+                    raw_dang = torch.atan2(
+                        torch.sin(Vraw[..., 1] - Vnewton[..., 1]),
+                        torch.cos(Vraw[..., 1] - Vnewton[..., 1]),
+                    )
+                    raw_mse = torch.mean(raw_dmag ** 2) + torch.mean(raw_dang ** 2)
+                    loss = loss + args.kol_raw_loss_weight * raw_mse
 
                 if train and not loss.requires_grad:
                     p0 = next(model.parameters())
                     loss = loss + 0.0 * p0.norm()
                     print("[warn] physics loss detached for this batch; applied zero-grad guard.")
             else:
-                Vpred = model(
+                Vraw = model(
                     bus_type,
                     Branch_f_bus, Branch_t_bus, Branch_status,
                     Branch_tau, Branch_shift_deg,
@@ -1106,6 +1265,19 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                     vn_log=vn_log,
                 )
 
+                if known_operator is not None:
+                    Vpred, kol_diag = known_operator(
+                        Vraw,
+                        Y_exact,
+                        Sstart_metric,
+                        bus_type,
+                        V_fixed=batch["V_start"].to(device),
+                        sizes=n_nodes_per_graph,
+                        differentiable=train,
+                    )
+                else:
+                    Vpred = Vraw
+
                 dmag = (Vpred[..., 0] - Vnewton[..., 0])
                 dang = torch.atan2(
                     torch.sin(Vpred[..., 1] - Vnewton[..., 1]),
@@ -1115,6 +1287,14 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                 mse_ang = torch.mean(dang ** 2)
                 mse = mse_mag + mse_ang
                 loss = mse
+                if known_operator is not None and args.kol_raw_loss_weight > 0.0:
+                    raw_dmag = Vraw[..., 0] - Vnewton[..., 0]
+                    raw_dang = torch.atan2(
+                        torch.sin(Vraw[..., 1] - Vnewton[..., 1]),
+                        torch.cos(Vraw[..., 1] - Vnewton[..., 1]),
+                    )
+                    raw_mse = torch.mean(raw_dmag ** 2) + torch.mean(raw_dang ** 2)
+                    loss = loss + args.kol_raw_loss_weight * raw_mse
 
                 # Zero-grad guard for pure-MSE mode (pinn=False).
                 # Root cause: when Armijo rejects all K steps for every
@@ -1129,21 +1309,7 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                     print("[warn] MSE loss detached (Armijo rejected all steps); applied zero-grad guard.")
 
             residual_metrics = compute_power_flow_residual_metrics(
-                ensure_dense_y_for_metrics(
-                    Y_metric,
-                    bus_type,
-                    Branch_f_bus,
-                    Branch_t_bus,
-                    Branch_status,
-                    Branch_tau_metric,
-                    Branch_shift_deg_metric,
-                    Branch_y_series_from_metric,
-                    Branch_y_series_to_metric,
-                    Branch_y_series_ft_metric,
-                    Branch_y_shunt_from_metric,
-                    Branch_y_shunt_to_metric,
-                    Y_shunt_bus_metric,
-                ),
+                Y_exact,
                 Vpred,
                 Sstart_metric,
                 bus_type,
@@ -1176,6 +1342,16 @@ def run_epoch(loader, *, train: bool, pinn: bool):
             _ctol = args.convergence_tol_pu
             _conv = (residual_metrics["max_dp_pu"] < _ctol) & (residual_metrics["max_dq_pu"] < _ctol)
             n_converged += int(_conv.sum().item())
+            if kol_diag is not None:
+                kol_initial_values.append(kol_diag["initial_max_mismatch"].detach().cpu())
+                kol_final_values.append(kol_diag["final_max_mismatch"].detach().cpu())
+                kol_converged_values.append(kol_diag["converged"].detach().cpu())
+                kol_iteration_values.append(kol_diag["iterations"].detach().cpu())
+            helm_module = getattr(model, "helm", None)
+            helm_diag = getattr(helm_module, "last_diagnostics", None)
+            if helm_diag:
+                helm_residual_values.append(helm_diag["max_mismatch"].detach().cpu())
+                helm_order_values.append(helm_diag["selected_order"].detach().cpu())
 
     mean_loss = sum_loss / max(n_graphs_total, 1)
     convergence_rate = n_converged / max(n_graphs_total, 1)
@@ -1197,6 +1373,22 @@ def run_epoch(loader, *, train: bool, pinn: bool):
     residual_dist["convergence_tol_pu"] = args.convergence_tol_pu
     residual_dist["n_converged"] = n_converged
     residual_dist["n_cases"] = n_graphs_total
+    if kol_final_values:
+        kol_initial = torch.cat(kol_initial_values).float()
+        kol_final = torch.cat(kol_final_values).float()
+        kol_converged = torch.cat(kol_converged_values).float()
+        kol_iterations = torch.cat(kol_iteration_values).float()
+        residual_dist["kol_initial_mean"] = kol_initial.mean().item()
+        residual_dist["kol_final_mean"] = kol_final.mean().item()
+        residual_dist["kol_certification_rate"] = kol_converged.mean().item()
+        residual_dist["kol_mean_iterations"] = kol_iterations.mean().item()
+        residual_dist["kol_tolerance"] = args.kol_tol
+    if helm_residual_values:
+        helm_residual = torch.cat(helm_residual_values).float()
+        helm_orders = torch.cat(helm_order_values).float()
+        residual_dist["helm_mean_max_mismatch"] = helm_residual.mean().item()
+        residual_dist["helm_max_mismatch"] = helm_residual.max().item()
+        residual_dist["helm_mean_selected_order"] = helm_orders.mean().item()
     return (
         mean_loss,
         mean_mse,
@@ -1518,8 +1710,21 @@ def run_nr_polish_eval():
                 vn_log=vn_log,
             )
             Vpred = out[0] if isinstance(out, tuple) else out
+            if known_operator is not None:
+                Vpred, _ = known_operator(
+                    Vpred,
+                    Yd,
+                    Sstart,
+                    bus_type,
+                    V_fixed=Vstart,
+                    sizes=n_nodes_per_graph,
+                    differentiable=False,
+                )
 
-            Yb = (Yd[0] if Yd.dim() == 3 else Yd).cpu().numpy()
+            Yb_tensor = Yd[0] if Yd.dim() == 3 else Yd
+            if Yb_tensor.is_sparse:
+                Yb_tensor = Yb_tensor.to_dense()
+            Yb = Yb_tensor.cpu().numpy()
             S_np = Sstart[0].cpu().numpy()
             bt_np = bus_type[0].cpu().numpy()
             vp = Vpred[0].cpu().numpy()

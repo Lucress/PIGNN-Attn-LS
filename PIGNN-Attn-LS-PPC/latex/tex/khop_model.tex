@@ -1,0 +1,332 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers}{natbib}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+\title{PIGNN-Attn-LS with K-Hop Gaussian Diffusion:\\
+  Extending Edge-Aware Attention for Multi-Hop Power-Flow Context}
+
+\author{%
+  Changhun Kim
+}
+
+\begin{document}
+
+\maketitle
+
+%==============================================================================
+\section{Background: Edge-Aware Self-Attention Solver (PIGNN-Attn-LS)}
+%==============================================================================
+
+\subsection{Unrolled Correction Steps}
+
+The base model (PIGNN-Attn-LS, \texttt{GNSMsg\_SelfAttention\_armijo.py})
+solves AC power flow by unrolling $K$ iterative correction steps over a graph
+$\mathcal{G} = (\mathcal{V}, \mathcal{E})$ with $N$ buses.
+At each step $k$, the power mismatches are computed from the current voltage
+estimate $(v^{(k)}, \theta^{(k)})$:
+
+\begin{equation}
+  V_c = v \cdot e^{j\theta}, \quad
+  I_c = Y V_c, \quad
+  S_c = V_c \odot I_c^*, \quad
+  \Delta P^{(k)} = P^{\mathrm{set}} - \mathrm{Re}\{S_c\}, \quad
+  \Delta Q^{(k)} = Q^{\mathrm{set}} - \mathrm{Im}\{S_c\}
+\end{equation}
+
+with slack/PV masking applied ($\Delta P$ zeroed at the slack bus;
+$\Delta Q$ zeroed at slack and PV buses).
+
+\subsection{Physics-Informed Node Features}
+
+The per-bus node state at step $k$ is:
+
+\begin{equation}
+  x_i^{(k)}
+  =
+  \bigl[
+    v_i^{(k)},\;
+    \theta_i^{(k)},\;
+    \Delta P_i^{(k)},\;
+    \Delta Q_i^{(k)},\;
+    m_i^{(k)}
+  \bigr]
+  \in \mathbb{R}^{4+d}
+\end{equation}
+
+where $m_i^{(k)} \in \mathbb{R}^d$ is a learned latent memory vector.
+The physics residuals $(\Delta P, \Delta Q)$ act as \emph{known-operator}
+features: they inject the full nonlinear AC-PF equations directly into the
+node representation at every step, so the GNN learns a residual-to-update
+mapping rather than a blind function approximation.
+
+\subsection{Edge-Aware Multi-Head Self-Attention}
+
+Instead of uniform (isotropic) aggregation, the base model uses a
+Transformer-style multi-head self-attention aggregator where each directed
+edge $(j \to i)$ carries an \emph{edge bias} derived from line admittances.
+
+For head $h$ with per-head dimension $d_h = d_{\mathrm{model}} / H$:
+
+\begin{equation}
+  q_i^{(h)} = W_Q^{(h)} x_i, \quad
+  k_j^{(h)} = W_K^{(h)} x_j, \quad
+  v_j^{(h)} = W_V^{(h)} x_j
+\end{equation}
+
+\begin{equation}
+  \alpha_{ij}^{(h)}
+  =
+  \mathrm{softmax}_j
+  \!\left(
+    \frac{\langle q_i^{(h)}, k_j^{(h)} \rangle}{\sqrt{d_h}}
+    + \beta_{ij}^{(h)}
+  \right),
+  \qquad
+  \beta_{ij}^{(h)} = f_{\mathrm{edge}}(\ell_{ij})
+\end{equation}
+
+The edge bias $\beta_{ij}^{(h)}$ is a learned function of the
+9-dimensional edge feature vector $\ell_{ij}$, which encodes the
+physical line parameters:
+$[y_{\mathrm{series},ij}^{\mathrm{re}},\; y_{\mathrm{series},ij}^{\mathrm{im}},\;
+y_{\mathrm{shunt},i}^{\mathrm{re}},\; \ldots,\; \tau_{ij},\; \phi_{ij},\;
+\mathbb{1}_{\mathrm{trafo}}]$.
+
+This injects the admittance structure of the Jacobian $J(x)$ into attention
+scores, making aggregation \emph{anisotropic} in a physically meaningful way:
+lines with large admittances receive higher attention, mirroring the
+Newton--Raphson Jacobian sensitivity structure.
+
+The aggregated context is projected to produce voltage/angle corrections:
+
+\begin{equation}
+  \Delta\theta_i^{(k)} = W_\theta^{(k)} h_i^{(k)}, \quad
+  \Delta v_i^{(k)} = W_v^{(k)} h_i^{(k)}, \quad
+  \Delta m_i^{(k)} = \mathrm{LayerNorm}\!\bigl(\tanh(W_m^{(k)} h_i^{(k)})\bigr)
+\end{equation}
+
+An Armijo backtracking line search then selects the step size $\alpha$
+that satisfies the sufficient-decrease condition on the power-mismatch
+$\ell^\infty$-norm before accepting the update.
+
+%==============================================================================
+\section{Extension: K-Hop Gaussian Diffusion
+  (\texttt{GNSMsg\_EdgeSelfAttnKHop})}
+%==============================================================================
+
+\subsection{Motivation}
+
+The base attention model aggregates only \emph{direct} (1-hop) neighbors at
+each message-passing step.  In power networks, a voltage disturbance
+propagates electrically across multiple buses in a single physical instant;
+the Jacobian $J(x)^{-1}$ therefore couples every bus to multi-hop
+neighbors.  With only $K$ unrolled steps and 1-hop attention per step, the
+effective receptive field is at most $K$ hops---which may be insufficient for
+large grids without many iterations.
+
+To address this, \texttt{GNSMsg\_EdgeSelfAttnKHop} augments the node state
+with a \emph{K-Hop Gaussian (KHG) diffusion} \cite{zhang2026khg} of the
+current node features before passing them to the attention blocks.  This
+gives each bus an enriched view of its multi-hop electrical neighborhood
+without increasing the depth of the attention network.
+
+\subsection{Transition Matrix from the Admittance Matrix}
+
+Rather than using a raw (binary) adjacency matrix, the model derives the
+transition matrix directly from $Y$, the complex admittance matrix of the
+grid.  Taking the element-wise absolute value and zeroing the diagonal:
+
+\begin{equation}
+  A_{ij} = |Y_{ij}|, \quad A_{ii} = 0
+\end{equation}
+
+$A_{ij}$ reflects the coupling strength between buses $i$ and $j$:
+larger admittance means stronger electrical coupling.  Two options are
+available via \texttt{--khop\_source}:
+\begin{itemize}[noitemsep]
+  \item \texttt{yabs} (default): $A_{ij} = |Y_{ij}|$, preserving
+    admittance magnitudes as edge weights.
+  \item \texttt{adj}: $A_{ij} = \mathbf{1}[|Y_{ij}| > 0]$, binary
+    topology only.
+\end{itemize}
+
+The matrix $A$ is then normalized to a stable transition operator $T$
+via \texttt{--khop\_norm}:
+\begin{align}
+  \text{row:} \quad & T = D_r^{-1} A, \quad D_r = \mathrm{diag}(A\mathbf{1})
+  \label{eq:row}\\
+  \text{sym:} \quad & T = D_r^{-1/2} A\, D_r^{-1/2}
+  \label{eq:sym}\\
+  \text{col:} \quad & T = A\, D_c^{-1}, \quad D_c = \mathrm{diag}(A^\top\mathbf{1})
+  \label{eq:col}
+\end{align}
+
+Row normalization (default) makes each row sum to 1, so $T$ is a
+row-stochastic matrix: it distributes a bus's information evenly weighted
+by admittance to its neighbors.
+
+\subsection{K-Hop Gaussian Diffusion Kernel}
+
+Following \cite{zhang2026khg}, we apply $T$ iteratively to propagate
+information across $K_{\mathrm{hop}}$ hops, weighting each hop $i$ by a
+Gaussian that decays with distance:
+
+\begin{equation}
+  w(i, \sigma) = \exp\!\left(-\frac{i^2}{2\sigma^2}\right), \quad
+  i = 1, \ldots, K_{\mathrm{hop}}
+\end{equation}
+
+where $\sigma > 0$ (\texttt{--khop\_sigma}) controls the effective range.
+Small $\sigma$ keeps information local; large $\sigma$ extends it further.
+
+The diffused feature matrix is the normalized weighted sum of hop-wise
+propagations:
+
+\begin{equation}
+  D_K X
+  =
+  \frac{\displaystyle\sum_{i=1}^{K_{\mathrm{hop}}} w(i,\sigma)\; T^i X}
+       {\displaystyle\sum_{i=1}^{K_{\mathrm{hop}}} w(i,\sigma)}
+  \label{eq:dkx}
+\end{equation}
+
+where $T^i X$ is computed recursively as $H^{(i)} = T \cdot H^{(i-1)}$
+with $H^{(0)} = X$.  The denominator $Z = \sum_i w(i,\sigma)$ normalizes
+so the output stays on the same scale as the input regardless of
+$K_{\mathrm{hop}}$ or $\sigma$.
+
+Intuitively, $D_K x_i$ is a smoothed average of the node states in
+the $K_{\mathrm{hop}}$-hop neighborhood of bus $i$, where closer buses
+(stronger electrical coupling) contribute more.
+
+\subsection{Integration into the Attention Solver}
+
+The only change to the forward pass relative to the base model is how the
+input to \texttt{in\_proj} is constructed.  In the base model:
+
+\begin{equation}
+  \text{(base)}\quad
+  z_i^{(k)} = W_{\mathrm{in}}\, x_i^{(k)}
+  \in \mathbb{R}^{d_{\mathrm{model}}}
+\end{equation}
+
+In the K-hop variant, the raw node state and its diffused counterpart are
+\emph{concatenated} and projected together:
+
+\begin{align}
+  x_i^{(k)} &= \bigl[v_i, \theta_i, \Delta P_i, \Delta Q_i, m_i\bigr]
+  \in \mathbb{R}^{4+d}
+  \label{eq:nodestate}\\
+  \tilde{x}_i^{(k)} &= \bigl(D_K X^{(k)}\bigr)_i
+  \in \mathbb{R}^{4+d}
+  \label{eq:diffused}\\
+  z_i^{(k)} &= W_{\mathrm{in}}\,
+  \bigl[x_i^{(k)} \;\|\; \tilde{x}_i^{(k)}\bigr]
+  \in \mathbb{R}^{d_{\mathrm{model}}}
+  \label{eq:proj}
+\end{align}
+
+where $\|\,$ denotes concatenation, so $W_{\mathrm{in}} \in
+\mathbb{R}^{d_{\mathrm{model}} \times 2(4+d)}$.
+Consequently, the input projection dimension doubles from $4+d$ to
+$2(4+d)$, which is the \textbf{only} architectural change relative to the
+base model.
+
+After projection, the same \texttt{EdgeSelfAttnBlock} layers, output heads,
+Armijo line search, and physics loss are used unchanged (they are directly
+imported from \texttt{GNSMsg\_SelfAttention\_armijo}).
+
+\subsection{What Each Component Contributes}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Component & Where & Role \\
+\midrule
+$x_i^{(k)}$ & local (1-hop) & current bus state + physics residuals \\
+$\tilde{x}_i^{(k)} = D_K x_i^{(k)}$ & multi-hop & smoothed neighborhood context \\
+Edge bias $\beta_{ij}$ & attention & admittance-weighted message routing \\
+Armijo line search & update & sufficient-decrease enforcement \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The diffusion $D_K$ acts as a \emph{preprocessing} module
+\cite{zhang2026khg}: it is computed once per iteration step before the
+attention blocks, not learned end-to-end.  This means the attention
+mechanism still handles the adaptive, physics-aware aggregation, but each
+bus now enters attention already aware of what is happening several hops
+away---an electrical version of ``pre-smoothing.''
+
+\subsection{Hyperparameters}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Argument & Default & Meaning \\
+\midrule
+\texttt{--khop\_K} & 3 & maximum hop distance $K_{\mathrm{hop}}$ \\
+\texttt{--khop\_sigma} & 1.5 & Gaussian decay scale $\sigma$ \\
+\texttt{--khop\_norm} & \texttt{row} & transition matrix normalization \\
+\texttt{--khop\_source} & \texttt{yabs} & edge weights from $|Y|$ or binary \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Setting \texttt{--khop\_K 0} recovers the base model exactly (the diffusion
+returns a zero tensor, contributing nothing after projection).
+
+%==============================================================================
+\section{Summary of Differences from the Base Model}
+%==============================================================================
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Aspect & PIGNN-Attn-LS (base) & K-Hop variant \\
+\midrule
+Node input to \texttt{in\_proj} & $x_i \in \mathbb{R}^{4+d}$ &
+  $[x_i \| D_K x_i] \in \mathbb{R}^{2(4+d)}$ \\
+\texttt{in\_proj} width & $4+d$ & $2(4+d)$ \\
+Receptive field per step & 1-hop (attn.) &
+  $K_{\mathrm{hop}}$-hop (diff.)\ +\ 1-hop (attn.) \\
+Transition matrix source & --- & $|Y|$ (admittance-weighted) \\
+Attention blocks & imported \texttt{EdgeSelfAttnBlock} &
+  same, unchanged \\
+Physics loss & same & same \\
+Armijo line search & same & same \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{thebibliography}{9}
+
+\bibitem{zhang2026khg}
+X.~Zhang, P.~Wang, D.~Li, A.~Huang, Z.~Chen, and Y.~Yang,
+``Enhanced graph neural networks using K-hop Gaussian diffusion,''
+in \emph{ICASSP 2026}, 2026.
+
+\bibitem{kim2026pignn}
+C.~Kim et al.,
+``Physics-informed GNN for medium-high voltage AC power flow with
+edge-aware attention and line search correction operator,''
+in \emph{ICASSP 2026}, 2026.
+
+\end{thebibliography}
+
+\end{document}
