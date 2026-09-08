@@ -102,6 +102,16 @@ def _build_train_config(merged: Mapping[str, Any], *, runname: str) -> TrainConf
             block_diag=bool(merged.get("BLOCK_DIAG", DEFAULTS["BLOCK_DIAG"])),
             weight_init=str(merged["weight_init"]),
             bias_init=float(merged["bias_init"]),
+            lambda_cost=float(merged.get("lambda_cost", 1.0)),
+            lambda_kcl=float(merged.get("lambda_kcl", 1.0)),
+            lambda_lim=float(merged.get("lambda_lim", 10.0)),
+            lambda_branch=float(merged.get("lambda_branch", 1.0)),
+            lambda_v=float(merged.get("lambda_v", 1.0)),
+            pg_step_frac=float(merged.get("pg_step_frac", 0.05)),
+            c1_default=float(merged.get("c1_default", 2.0)),
+            c2_default=float(merged.get("c2_default", 0.5)),
+            pg_lim_frac=float(merged.get("pg_lim_frac", 0.30)),
+            s_max_pu=float(merged.get("s_max_pu", 1.0)),
         ),
         optim=OptimCfg(
             batch_size=int(merged["BATCH"]),
@@ -229,6 +239,19 @@ def parse_train_config(argv: list[str] | None = None) -> tuple[TrainConfig, str 
     merged["use_armijo"] = bool(get(raw, ("model", "use_armijo"), merged["use_armijo"]))
     merged["DthetaMax"] = float(get(raw, ("model", "DthetaMax"), merged["DthetaMax"]))
     merged["DvmFrac"] = float(get(raw, ("model", "DvmFrac"), merged["DvmFrac"]))
+
+    # OPF-specific model hyperparameters
+    merged["lambda_cost"]    = float(get(raw, ("model", "lambda_cost"),    merged["lambda_cost"]))
+    merged["lambda_kcl"]     = float(get(raw, ("model", "lambda_kcl"),     merged["lambda_kcl"]))
+    merged["lambda_kcl_inf"] = float(get(raw, ("model", "lambda_kcl_inf"), merged["lambda_kcl_inf"]))
+    merged["lambda_lim"]     = float(get(raw, ("model", "lambda_lim"),     merged["lambda_lim"]))
+    merged["lambda_branch"] = float(get(raw, ("model", "lambda_branch"), merged["lambda_branch"]))
+    merged["lambda_v"]      = float(get(raw, ("model", "lambda_v"),      merged["lambda_v"]))
+    merged["pg_step_frac"]  = float(get(raw, ("model", "pg_step_frac"),  merged["pg_step_frac"]))
+    merged["c1_default"]    = float(get(raw, ("model", "c1_default"),    merged["c1_default"]))
+    merged["c2_default"]    = float(get(raw, ("model", "c2_default"),    merged["c2_default"]))
+    merged["pg_lim_frac"]   = float(get(raw, ("model", "pg_lim_frac"),   merged["pg_lim_frac"]))
+    merged["s_max_pu"]      = float(get(raw, ("model", "s_max_pu"),      merged["s_max_pu"]))
 
     merged["BATCH"] = int(get(raw, ("train", "batch_size"), merged["BATCH"]))
     merged["EPOCHS"] = int(get(raw, ("train", "epochs"), merged["EPOCHS"]))

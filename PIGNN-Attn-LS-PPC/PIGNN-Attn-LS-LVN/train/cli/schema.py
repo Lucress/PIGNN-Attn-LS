@@ -47,6 +47,18 @@ class ModelCfg:
     block_diag: bool
     weight_init: str
     bias_init: float
+    # OPF-specific (ignored by PF builders via **_unused)
+    lambda_cost: float = 1.0
+    lambda_kcl: float = 1.0
+    lambda_kcl_inf: float = 0.0  # KCL L∞ weight; 0 = L2-only (backward-compat default)
+    lambda_lim: float = 10.0
+    lambda_branch: float = 1.0
+    lambda_v: float = 1.0
+    pg_step_frac: float = 0.05
+    c1_default: float = 2.0
+    c2_default: float = 0.5
+    pg_lim_frac: float = 0.30
+    s_max_pu: float = 1.0
 
 
 @dataclass(frozen=True)

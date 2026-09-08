@@ -16,6 +16,8 @@ from .data import build_dataloaders
 from .logger import configure_logging, log
 from .run_paths import ensure_run_dirs, make_run_paths
 from .loop import evaluate_test, train_validate
+from .opf_loop import evaluate_test_opf, train_validate_opf
+from .opf_supervised_loop import evaluate_test_opf_supervised, train_validate_opf_supervised
 from .mlflow_utils import (
     add_basic_tags,
     log_params_safe,
@@ -102,6 +104,18 @@ def main(argv: list[str] | None = None) -> int:
             dvm_frac=cfg.model.dvm_frac,
             num_attn_layers=cfg.model.num_attn_layers,
             device=device,
+            # OPF-specific (ignored by PF builders via **_unused)
+            lambda_cost=cfg.model.lambda_cost,
+            lambda_kcl=cfg.model.lambda_kcl,
+            lambda_kcl_inf=cfg.model.lambda_kcl_inf,
+            lambda_lim=cfg.model.lambda_lim,
+            lambda_branch=cfg.model.lambda_branch,
+            lambda_v=cfg.model.lambda_v,
+            pg_step_frac=cfg.model.pg_step_frac,
+            c1_default=cfg.model.c1_default,
+            c2_default=cfg.model.c2_default,
+            pg_lim_frac=cfg.model.pg_lim_frac,
+            s_max_pu=cfg.model.s_max_pu,
         )
         _load_or_init_weights(model, cfg)
         _apply_peft_and_freezing(model, cfg.peft)
@@ -181,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             _compare_with_baseline(mlf, cfg.compare, final_metrics)
             _write_history_csv(rows, paths.artifacts_dir)
+            _write_final_metrics_json(final_metrics, paths.artifacts_dir)
             _plot_history_safe(history, cfg.model.pinn, str(paths.plots_dir))
 
             if mlf is not None:
@@ -468,29 +483,97 @@ def _make_epoch_metrics_callback(
     rows: dict[tuple[int, str], dict[str, float]],
 ) -> Callable[[int, str, object], None]:
     def on_epoch_metrics(epoch: int, split: str, m) -> None:
-        metrics = {
-            f"{split}/loss": float(m.loss),
-            f"{split}/rmse": float(m.rmse),
-            f"{split}/rmse_mag": float(m.rmse_mag),
-            f"{split}/rmse_ang_deg": float(m.rmse_ang_deg),
+        from .opf_loop import OPFEpochMetrics
+        from .opf_supervised_loop import OPFSupervisedMetrics
+        is_opf = isinstance(m, OPFEpochMetrics)
+        is_sup = isinstance(m, OPFSupervisedMetrics)
+
+        metrics: dict[str, float] = {
+            f"{split}/loss":        float(m.loss),
+            f"{split}/rmse":        float(m.rmse),
+            f"{split}/rmse_mag":    float(m.rmse_mag),
+            f"{split}/rmse_ang_deg":float(m.rmse_ang_deg),
         }
+        if is_opf:
+            metrics.update({
+                f"{split}/gen_cost":          float(m.gen_cost),
+                f"{split}/kcl_loss":          float(m.kcl_loss),
+                f"{split}/lim_loss":          float(m.lim_loss),
+                f"{split}/branch_loss":       float(m.branch_loss),
+                f"{split}/v_loss":            float(m.v_loss),
+                f"{split}/kcl_inf_norm":      float(m.kcl_inf_norm),
+                f"{split}/branch_max":        float(m.branch_max),
+                f"{split}/lim_max":           float(m.lim_max),
+                f"{split}/v_inf_norm":        float(m.v_inf_norm),
+                f"{split}/feasibility_rate":  float(m.feasibility_rate),
+                f"{split}/runtime_ms":        float(m.runtime_ms_per_sample),
+            })
+        elif is_sup:
+            metrics.update({
+                f"{split}/v_mse":      float(m.v_mse),
+                f"{split}/pg_mse":     float(m.pg_mse),
+                f"{split}/obj_gap":    float(m.obj_gap),
+                f"{split}/cost_pred":  float(m.cost_pred),
+                f"{split}/cost_opt":   float(m.cost_opt),
+                f"{split}/runtime_ms": float(m.runtime_ms_per_sample),
+            })
+
         if mlf is not None:
             for k, v in metrics.items():
                 try:
                     mlf.log_metric(k, v, step=int(epoch))
                 except Exception:
                     pass
-        rows[(int(epoch), split)] = {
-            "epoch": float(epoch),
-            "split": split,
-            "loss": float(m.loss),
-            "rmse": float(m.rmse),
-            "rmse_mag": float(m.rmse_mag),
+
+        row: dict[str, float | str] = {
+            "epoch":        float(epoch),
+            "split":        split,
+            "loss":         float(m.loss),
+            "rmse":         float(m.rmse),
+            "rmse_mag":     float(m.rmse_mag),
             "rmse_ang_deg": float(m.rmse_ang_deg),
-            "phys": float(m.phys),
+            "phys":         float(m.phys),
         }
+        if is_opf:
+            row.update({
+                "gen_cost":              float(m.gen_cost),
+                "kcl_loss":              float(m.kcl_loss),
+                "lim_loss":              float(m.lim_loss),
+                "branch_loss":           float(m.branch_loss),
+                "v_loss":                float(m.v_loss),
+                "kcl_inf_norm":          float(m.kcl_inf_norm),
+                "branch_max":            float(m.branch_max),
+                "lim_max":               float(m.lim_max),
+                "v_inf_norm":            float(m.v_inf_norm),
+                "feasibility_rate":      float(m.feasibility_rate),
+                "runtime_ms_per_sample": float(m.runtime_ms_per_sample),
+            })
+        elif is_sup:
+            row.update({
+                "v_mse":                 float(m.v_mse),
+                "pg_mse":                float(m.pg_mse),
+                "obj_gap":               float(m.obj_gap),
+                "cost_pred":             float(m.cost_pred),
+                "cost_opt":              float(m.cost_opt),
+                "runtime_ms_per_sample": float(m.runtime_ms_per_sample),
+            })
+        rows[(int(epoch), split)] = row
 
     return on_epoch_metrics
+
+
+def _is_opf_model(model) -> bool:
+    """True when the model is the OPF variant (Model 2 physics or Model 1 supervised)."""
+    try:
+        from models.edge_selfattn.opf_model import GNSMsg_EdgeSelfAttn_OPF
+        return isinstance(model, GNSMsg_EdgeSelfAttn_OPF)
+    except Exception:
+        return False
+
+
+def _is_opf_supervised_model(cfg) -> bool:
+    """True when the config requests the supervised OPF training loop (Model 1)."""
+    return cfg.model.name == "GNSMsg_EdgeSelfAttn_OPF_Supervised"
 
 
 def _run_train_phase(
@@ -510,7 +593,15 @@ def _run_train_phase(
     assert optim_bundle is not None
 
     best_ckpt_path = str(Path(paths.ckpt_dir) / "best.ckpt")
-    history = train_validate(
+
+    if _is_opf_supervised_model(cfg):
+        _train_fn = train_validate_opf_supervised
+    elif _is_opf_model(model):
+        _train_fn = train_validate_opf
+    else:
+        _train_fn = train_validate
+
+    history = _train_fn(
         model=model,
         train_loader=splits.train_loader,
         val_loader=splits.val_loader,
@@ -529,15 +620,23 @@ def _run_train_phase(
         try:
             mlf.log_metric("best/epoch", float(history.best_epoch))
             mlf.log_metric("best/score", float(history.best_score))
-            mlf.log_metric("best/val_rmse_mag", float(history.best_val_rmse_mag))
-            mlf.log_metric("best/val_rmse_ang_deg", float(history.best_val_rmse_ang_deg))
+            if hasattr(history, "best_val_rmse_mag"):
+                mlf.log_metric("best/val_rmse_mag", float(history.best_val_rmse_mag))
+                mlf.log_metric("best/val_rmse_ang_deg", float(history.best_val_rmse_ang_deg))
+            elif hasattr(history, "best_val_gen_cost"):
+                mlf.log_metric("best/val_gen_cost", float(history.best_val_gen_cost))
+                mlf.log_metric("best/val_kcl", float(history.best_val_kcl))
         except Exception:
             pass
 
     final_metrics["best/epoch"] = float(history.best_epoch)
     final_metrics["best/score"] = float(history.best_score)
-    final_metrics["best/val_rmse_mag"] = float(history.best_val_rmse_mag)
-    final_metrics["best/val_rmse_ang_deg"] = float(history.best_val_rmse_ang_deg)
+    if hasattr(history, "best_val_rmse_mag"):
+        final_metrics["best/val_rmse_mag"] = float(history.best_val_rmse_mag)
+        final_metrics["best/val_rmse_ang_deg"] = float(history.best_val_rmse_ang_deg)
+    elif hasattr(history, "best_val_gen_cost"):
+        final_metrics["best/val_gen_cost"] = float(history.best_val_gen_cost)
+        final_metrics["best/val_kcl"] = float(history.best_val_kcl)
     return history
 
 
@@ -553,26 +652,87 @@ def _run_eval_phase(
     if "test" not in cfg.run.mode:
         return
 
-    m_test = evaluate_test(
+    if _is_opf_supervised_model(cfg):
+        _eval_fn = evaluate_test_opf_supervised
+    elif _is_opf_model(model):
+        _eval_fn = evaluate_test_opf
+    else:
+        _eval_fn = evaluate_test
+
+    m_test = _eval_fn(
         model=model,
         test_loader=splits.test_loader,
         device=device,
         pinn=cfg.model.pinn,
         block_diag=cfg.model.block_diag,
     )
-    if mlf is not None:
-        try:
-            mlf.log_metric("test/loss", float(m_test.loss))
-            mlf.log_metric("test/rmse", float(m_test.rmse))
-            mlf.log_metric("test/rmse_mag", float(m_test.rmse_mag))
-            mlf.log_metric("test/rmse_ang_deg", float(m_test.rmse_ang_deg))
-        except Exception:
-            pass
 
-    final_metrics["test/loss"] = float(m_test.loss)
-    final_metrics["test/rmse"] = float(m_test.rmse)
-    final_metrics["test/rmse_mag"] = float(m_test.rmse_mag)
-    final_metrics["test/rmse_ang_deg"] = float(m_test.rmse_ang_deg)
+    from .opf_loop import OPFEpochMetrics
+    from .opf_supervised_loop import OPFSupervisedMetrics
+    is_opf = isinstance(m_test, OPFEpochMetrics)
+    is_sup = isinstance(m_test, OPFSupervisedMetrics)
+
+    if is_opf:
+        log.info(
+            "TEST  | loss %.4e  gen_cost %.4e  kcl %.4e  lim %.4e  branch %.4e  v %.4e | "
+            "kcl_inf %.4e  branch_max %.4e  lim_max %.4e  v_max %.4e | feasible %.1f%%  rt %.2fms/s",
+            m_test.total_loss, m_test.gen_cost, m_test.kcl_loss, m_test.lim_loss,
+            m_test.branch_loss, m_test.v_loss,
+            m_test.kcl_inf_norm, m_test.branch_max, m_test.lim_max, m_test.v_inf_norm,
+            m_test.feasibility_rate * 100.0, m_test.runtime_ms_per_sample,
+        )
+    elif is_sup:
+        log.info(
+            "TEST  | loss %.4e  v_mse %.4e  pg_mse %.4e  obj_gap %.3f%%  "
+            "cost_pred %.4e  cost_opt %.4e  rt %.2fms/s",
+            m_test.total_loss, m_test.v_mse, m_test.pg_mse, m_test.obj_gap * 100.0,
+            m_test.cost_pred, m_test.cost_opt, m_test.runtime_ms_per_sample,
+        )
+    else:
+        log.info(
+            "TEST  | loss %.4e  rmse %.4e  rmse_mag %.4e  rmse_ang_deg %.4e",
+            m_test.loss, m_test.rmse, m_test.rmse_mag, m_test.rmse_ang_deg,
+        )
+
+    final_metrics["test/loss"]        = float(m_test.loss)
+    final_metrics["test/rmse"]        = float(m_test.rmse)
+    final_metrics["test/rmse_mag"]    = float(m_test.rmse_mag)
+    final_metrics["test/rmse_ang_deg"]= float(m_test.rmse_ang_deg)
+
+    if is_opf:
+        final_metrics.update({
+            "test/gen_cost":         float(m_test.gen_cost),
+            "test/kcl_loss":         float(m_test.kcl_loss),
+            "test/lim_loss":         float(m_test.lim_loss),
+            "test/branch_loss":      float(m_test.branch_loss),
+            "test/v_loss":           float(m_test.v_loss),
+            "test/kcl_inf_norm":     float(m_test.kcl_inf_norm),
+            "test/branch_max":       float(m_test.branch_max),
+            "test/lim_max":          float(m_test.lim_max),
+            "test/v_inf_norm":       float(m_test.v_inf_norm),
+            "test/feasibility_rate": float(m_test.feasibility_rate),
+        })
+    elif is_sup:
+        final_metrics.update({
+            "test/v_mse":    float(m_test.v_mse),
+            "test/pg_mse":   float(m_test.pg_mse),
+            "test/obj_gap":  float(m_test.obj_gap),
+            "test/cost_pred":float(m_test.cost_pred),
+            "test/cost_opt": float(m_test.cost_opt),
+        })
+
+    mlf_metrics = {
+        "test/loss": float(m_test.loss),
+        "test/rmse": float(m_test.rmse),
+        "test/rmse_mag": float(m_test.rmse_mag),
+        "test/rmse_ang_deg": float(m_test.rmse_ang_deg),
+    }
+    if mlf is not None:
+        for k, v in mlf_metrics.items():
+            try:
+                mlf.log_metric(k, v)
+            except Exception:
+                pass
 
 
 def _compare_with_baseline(mlf, compare: CompareCfg, final_metrics: dict[str, float]) -> None:
@@ -638,25 +798,47 @@ def _compare_with_baseline(mlf, compare: CompareCfg, final_metrics: dict[str, fl
 
 def _write_history_csv(rows: dict[tuple[int, str], dict[str, float]], artifacts_dir: str) -> None:
     try:
+        if not rows:
+            return
+
+        BASE_FIELDS = ["epoch", "split", "loss", "rmse", "rmse_mag", "rmse_ang_deg", "phys"]
+        OPF_FIELDS = [
+            "gen_cost", "kcl_loss", "lim_loss", "branch_loss", "v_loss",
+            "kcl_inf_norm", "branch_max", "lim_max", "v_inf_norm",
+            "feasibility_rate", "runtime_ms_per_sample",
+        ]
+        SUPERVISED_FIELDS = [
+            "v_mse", "pg_mse", "obj_gap", "cost_pred", "cost_opt",
+            "runtime_ms_per_sample",
+        ]
+
+        sample_row = next(iter(rows.values()))
+        has_opf = any(f in sample_row for f in OPF_FIELDS)
+        has_sup = any(f in sample_row for f in SUPERVISED_FIELDS)
+        if has_opf:
+            fieldnames = BASE_FIELDS + OPF_FIELDS
+        elif has_sup:
+            fieldnames = BASE_FIELDS + SUPERVISED_FIELDS
+        else:
+            fieldnames = BASE_FIELDS
+
         hist_csv = Path(artifacts_dir) / "history.csv"
         with hist_csv.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(
-                f,
-                fieldnames=["epoch", "split", "loss", "rmse", "rmse_mag", "rmse_ang_deg", "phys"],
-            )
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             w.writeheader()
             for _, row in sorted(rows.items(), key=lambda kv: (kv[0][0], kv[0][1])):
-                w.writerow(
-                    {
-                        "epoch": int(row["epoch"]),
-                        "split": row["split"],
-                        "loss": row["loss"],
-                        "rmse": row["rmse"],
-                        "rmse_mag": row["rmse_mag"],
-                        "rmse_ang_deg": row["rmse_ang_deg"],
-                        "phys": row.get("phys", 0.0),
-                    }
-                )
+                out = {k: row.get(k, 0.0) for k in fieldnames}
+                out["epoch"] = int(row["epoch"])
+                out["split"] = row["split"]
+                w.writerow(out)
+    except Exception:
+        pass
+
+
+def _write_final_metrics_json(final_metrics: dict, artifacts_dir: str) -> None:
+    try:
+        path = Path(artifacts_dir) / "final_metrics.json"
+        path.write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -665,8 +847,16 @@ def _plot_history_safe(history, pinn: bool, plots_dir: str) -> None:
     if history is None:
         return
     try:
-        from .plotting import plot_history
-
-        plot_history(history=history, pinn=pinn, plots_dir=plots_dir)
+        if hasattr(history, "train_rmse_mag"):
+            from .plotting import plot_history
+            plot_history(history=history, pinn=pinn, plots_dir=plots_dir)
+        elif hasattr(history, "train_v_mse"):
+            # OPFSupervisedTrainHistory — supervised OPF plots
+            from .plotting import plot_supervised_history
+            plot_supervised_history(history=history, plots_dir=plots_dir)
+        else:
+            # OPFTrainHistory — physics-informed OPF plots
+            from .plotting import plot_opf_history
+            plot_opf_history(history=history, plots_dir=plots_dir)
     except Exception:
         pass

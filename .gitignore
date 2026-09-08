@@ -73,7 +73,7 @@ terminal_log_capture*.txt
 /PIGNN-Attn-LS-PPC/sbatch/*/
 /ScenarioSynthesis_PPC/sbatch/*/
 /sbatch/*/
-# sbatch/previous/ holds hand-written job scripts, not run output
+# sbatch/previous/ holds hand-written job scripts, not run default
 !/sbatch/previous/
 /PIGNN-Attn-LS-PPC/results/logs/
 /PIGNN-Attn-LS-PPC/results/plots/
@@ -110,3 +110,5 @@ terminal_log_capture*.txt
 *.out.ps
 *.synctex.gz
 *.toc
+
+CLAUDE_CHECKPOINT.md

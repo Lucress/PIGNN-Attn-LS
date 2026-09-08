@@ -7,7 +7,8 @@ import torch
 # --------------------------------------------------------------------------- #
 # Per-bus vectors (length N). Complex vectors are fine here.
 _VECTOR_FIELDS = (
-    "bus_type U_start U_newton S_start S_newton I_newton vn_log".split()
+    "bus_type U_start U_newton S_start S_newton I_newton vn_log "
+    "Pg_opt V_opt_mag V_opt_ang".split()
 )  # shape: (N,)
 
 # Two-channel per-bus tensors (mag, angle)
@@ -74,5 +75,10 @@ def collate_blockdiag(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch
     # keep raw tensors for optional use (no batch dim)
     out["offsets"] = offsets               # (num_grids,)
     out["sizes"] = sizes                   # (num_grids,)
+
+    # Scalar OPF labels — one per sample, stacked to (num_grids,)
+    # Added AFTER the unsqueeze loop so they keep their (num_grids,) shape.
+    if all("cost_opt" in s for s in samples):
+        out["cost_opt"] = torch.stack([s["cost_opt"] for s in samples])
 
     return out

@@ -195,6 +195,8 @@ class ChanghunDataset(Dataset):
             # Optional LVN-only: per-bus voltage class log10(vn_kv).
             # Decoder filters out columns that don't exist in the dataframe.
             'vn_log',
+            # Optional OPF labels (present only in OPF datasets with _economic_dispatch).
+            'Pg_opt', 'V_opt_mag', 'V_opt_ang',
         ]
         # Filter for columns that actually exist in the dataframe to avoid errors
         binary_cols_exist = [col for col in binary_cols if col in df.columns]
@@ -483,6 +485,13 @@ class ChanghunDataset(Dataset):
                 I_newton = _to_complex_array(r.I_newton) / I_base
                 row["I_newton"] = to_t(I_newton, dtype=torch.complex64)
 
+            # OPF labels (optional — only in OPF datasets)
+            for _key in ("Pg_opt", "V_opt_mag", "V_opt_ang"):
+                if _key in df.columns:
+                    row[_key] = to_t(np.asarray(getattr(r, _key), dtype=FLOAT_DTYPE))
+            if "cost_opt" in df.columns:
+                row["cost_opt"] = to_t(float(r.cost_opt))
+
             self.rows.append(row)
 
         # Cache a CPU copy so it is portable across machines.
@@ -565,6 +574,8 @@ class ChanghunDataset(Dataset):
             "Y_matrix", "u_start", "u_newton", "S_start", "S_newton",
             "I_newton", "vn_log",
             "active_pair_idx", "active_Y_series", "active_Y_shunt",
+            # Optional OPF labels
+            "Pg_opt", "V_opt_mag", "V_opt_ang",
         ]
         decoded: Dict[str, Any] = {}
         for c in binary_cols:
@@ -696,5 +707,12 @@ class ChanghunDataset(Dataset):
         if "I_newton" in decoded:
             I_newton = _to_complex_array(decoded["I_newton"]) / I_base
             row["I_newton"] = to_t(I_newton, dtype=torch.complex64)
+
+        # OPF labels (optional — only in OPF datasets)
+        for _key in ("Pg_opt", "V_opt_mag", "V_opt_ang"):
+            if _key in decoded:
+                row[_key] = to_t(np.asarray(decoded[_key], dtype=FLOAT_DTYPE))
+        if "cost_opt" in cols:
+            row["cost_opt"] = to_t(float(r_raw["cost_opt"]))
 
         return row

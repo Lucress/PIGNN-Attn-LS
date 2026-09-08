@@ -69,6 +69,19 @@ DEFAULTS = {
     # Default matches the three prediction heads in the model.
     "head_only_modules": ["theta_head", "v_head", "m_head"],
 
+    # OPF-specific hyperparameters (used only with GNSMsg_EdgeSelfAttn_OPF)
+    "lambda_cost": 1.0,
+    "lambda_kcl": 1.0,      # KCL L2 weight (average mismatch)
+    "lambda_kcl_inf": 0.0,  # KCL L∞ weight (worst-node mismatch); 0 = disabled
+    "lambda_lim": 10.0,
+    "lambda_branch": 1.0,
+    "lambda_v": 1.0,
+    "pg_step_frac": 0.05,
+    "c1_default": 2.0,
+    "c2_default": 0.5,
+    "pg_lim_frac": 0.30,
+    "s_max_pu": 1.0,
+
     # Compare metrics vs a baseline MLflow run (optional)
     "compare": False,
     "compare_baseline_run_id": None,
