@@ -291,11 +291,13 @@ class EdgeSelfAttnBlock(nn.Module):
         )
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, edge_index_dir: torch.Tensor, edge_feat_dir: torch.Tensor):
+    def forward(self, x: torch.Tensor, edge_index_dir: torch.Tensor, edge_feat_dir: torch.Tensor,
+                return_attn: bool = False):
         """
         x:             (B, N, D)
         edge_index_dir:(E, 2)
         edge_feat_dir: (E, F)
+        return_attn:   if True, also return alpha (B, E, H) — head-averaged edge weights
         """
         B, N, D = x.shape
         device = x.device
@@ -325,7 +327,10 @@ class EdgeSelfAttnBlock(nn.Module):
 
         z = self.ln2(x)
         z = self.drop(self.ffn(z))
-        return x + z
+        result = x + z
+        if return_attn:
+            return result, alpha  # alpha: (B, E, H)
+        return result
 
 
 # ------------------ main model ------------------

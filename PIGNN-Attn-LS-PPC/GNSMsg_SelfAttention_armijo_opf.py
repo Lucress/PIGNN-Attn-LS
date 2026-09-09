@@ -92,6 +92,8 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
         vn_log=None,
         v_min=None,             # per-bus band; falls back to the parent's scalars
         v_max=None,
+        return_attn=False,      # if True, return collected attention weights
+        return_attn_heads=False,# if True, keep per-head (E,H); else mean over heads (E,)
     ):
         device = bus_type.device
         B, N = bus_type.shape
@@ -175,6 +177,7 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
             v_max = torch.full_like(v, 1.20)
 
         phys_terms = []
+        collected_attn = []  # list of (E, H) tensors, one per step
 
         for k in range(self.K):
             Vc = v * torch.exp(1j * th)
@@ -193,8 +196,15 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
                 bus_feat = torch.cat([bus_feat, extra], dim=-1)
             x = self.in_proj(torch.cat([bus_feat, m], dim=-1))
 
+            step_alpha = None
             for blk in self.blocks:
-                x = blk(x, edge_index_dir, edge_feat_dir)
+                if return_attn:
+                    x, step_alpha = blk(x, edge_index_dir, edge_feat_dir, return_attn=True)
+                else:
+                    x = blk(x, edge_index_dir, edge_feat_dir)
+            if return_attn and step_alpha is not None:
+                raw = step_alpha[0].detach().cpu()  # (E, H)
+                collected_attn.append(raw if return_attn_heads else raw.mean(dim=-1))
 
             dth = self.theta_head[k](x).squeeze(-1)
             dv = self.v_head[k](x).squeeze(-1)
@@ -278,5 +288,9 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
                 DQ = (Q_set - Sc.imag) * enforce_q.to(Q_set.dtype)
                 phys_terms.append(self.physics_final_weight * self._physics_residual_loss(
                     DP, DQ, P_set, Q_set, enforce_p, enforce_q, n_nodes_per_graph))
+            if return_attn:
+                return out, torch.sum(torch.stack(phys_terms)), collected_attn, edge_index_dir.cpu()
             return out, torch.sum(torch.stack(phys_terms))
+        if return_attn:
+            return out, None, collected_attn, edge_index_dir.cpu()
         return out

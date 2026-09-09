@@ -30,7 +30,22 @@ from opf_task import (
     opf_decision_space, opf_loss, opf_metrics, format_opf_metrics,
     opf_residual_and_violation,
 )
-from train_valid_test_gridfm import Tee, angle_diff
+class Tee:
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, data):
+        for f in self.files:
+            f.write(data)
+            f.flush()
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+
+def angle_diff(a, b):
+    return torch.atan2(torch.sin(a - b), torch.cos(a - b))
 from GNSMsg_SelfAttention_armijo_opf import GNSMsg_EdgeSelfAttn_OPF
 from GNSMsg_SelfAttention_armijo import _build_dense_Y_from_branchrows_single
 
@@ -368,7 +383,9 @@ def run():
                   f"| time {time.time()-t0:.2f}s")
             if va["loss"] < best_val:
                 best_val = va["loss"]
-                torch.save(model.state_dict(), best_path)
+                tmp_path = best_path + ".tmp"
+                torch.save(model.state_dict(), tmp_path)
+                os.replace(tmp_path, best_path)
                 print(f"  checkpoint saved to {best_path}")
         else:
             print(f"Epoch {epoch:3d} | {fmt('train', tr)} | time {time.time()-t0:.2f}s")
