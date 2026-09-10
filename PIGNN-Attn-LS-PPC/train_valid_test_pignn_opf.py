@@ -69,6 +69,10 @@ def parse_args():
     p.add_argument("--max_train_samples", type=int, default=0)
     p.add_argument("--max_valid_samples", type=int, default=0)
     p.add_argument("--max_test_samples", type=int, default=0)
+    p.add_argument("--chunk_dir", default="",
+                   help="case500 chunk dir (group_N.pt files); if set, uses ChunkedOPFDataset")
+    p.add_argument("--n_train_groups", type=int, default=4,
+                   help="number of training groups when using --chunk_dir")
     p.add_argument("--VAL_EVERY", type=int, default=1)
     p.add_argument("--resume_state_dict", default="")
     p.add_argument("--validate_branch_rows", action="store_true")
@@ -225,11 +229,19 @@ def run():
     print(f"[solver] K={args.K} d_hi={args.d_hi} heads={args.n_heads} "
           f"layers={args.num_attn_layers} armijo={args.use_armijo}/{args.armijo_mode}")
 
-    train_loader, train_eval_loader, val_loader, test_loader = make_opfdata_loaders(
-        args.opfdata_root, args.case_name, args.BATCH, num_groups=args.num_groups,
-        topological_perturbations=args.topological_perturbations,
-        max_train=args.max_train_samples, max_valid=args.max_valid_samples,
-        max_test=args.max_test_samples, num_workers=args.num_workers)
+    if args.chunk_dir:
+        from opfdata_pipeline import make_case500_loaders
+        train_loader, train_eval_loader, val_loader, test_loader = make_case500_loaders(
+            args.chunk_dir, args.BATCH,
+            n_train_groups=args.n_train_groups,
+            max_train=args.max_train_samples, max_valid=args.max_valid_samples,
+            max_test=args.max_test_samples, num_workers=args.num_workers)
+    else:
+        train_loader, train_eval_loader, val_loader, test_loader = make_opfdata_loaders(
+            args.opfdata_root, args.case_name, args.BATCH, num_groups=args.num_groups,
+            topological_perturbations=args.topological_perturbations,
+            max_train=args.max_train_samples, max_valid=args.max_valid_samples,
+            max_test=args.max_test_samples, num_workers=args.num_workers)
 
     if args.validate_branch_rows:
         b0 = next(iter(test_loader))

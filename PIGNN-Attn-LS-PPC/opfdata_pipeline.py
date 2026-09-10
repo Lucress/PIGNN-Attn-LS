@@ -227,6 +227,114 @@ def make_opfdata_loaders(root: str, case_name: str, batch_size: int,
 
 
 # --------------------------------------------------------------------------- #
+# Chunked case500 loader (raw JSON dicts → HeteroData, no PyG OPFDataset)
+# --------------------------------------------------------------------------- #
+
+import os as _os
+
+
+def json_to_heterodata(record: dict) -> HeteroData:
+    """Convert one raw OPFData JSON dict (from a group_N.pt chunk) to HeteroData.
+
+    Structure expected (confirmed on case500 group_0):
+      record["grid"]["nodes"]  : bus (N,4), generator (G,11), load (L,2), shunt (S,2)
+      record["grid"]["edges"]  : ac_line/transformer each have senders/receivers/features;
+                                 generator_link/load_link/shunt_link have senders/receivers
+      record["solution"]["nodes"]: bus (N,2) [va, vm], generator (G,2) [pg, qg]
+      record["metadata"]["objective"]: float
+    """
+    grid = record["grid"]
+    sol  = record["solution"]
+
+    data = HeteroData()
+
+    # ── node features ─────────────────────────────────────────────────────────
+    data["bus"].x       = torch.tensor(grid["nodes"]["bus"],       dtype=torch.float32)
+    data["bus"].y       = torch.tensor(sol["nodes"]["bus"],        dtype=torch.float32)
+    data["generator"].x = torch.tensor(grid["nodes"]["generator"], dtype=torch.float32)
+    data["generator"].y = torch.tensor(sol["nodes"]["generator"],  dtype=torch.float32)
+    data["load"].x      = torch.tensor(grid["nodes"]["load"],      dtype=torch.float32)
+
+    shunt_feats = grid["nodes"].get("shunt", [])
+    if shunt_feats:
+        data["shunt"].x = torch.tensor(shunt_feats, dtype=torch.float32)
+
+    # ── helper ────────────────────────────────────────────────────────────────
+    def _ei(e):
+        return torch.tensor([e["senders"], e["receivers"]], dtype=torch.long)
+
+    # ── branch edges (with features) ──────────────────────────────────────────
+    ac  = grid["edges"]["ac_line"]
+    data["bus", "ac_line", "bus"].edge_index = _ei(ac)
+    data["bus", "ac_line", "bus"].edge_attr  = torch.tensor(ac["features"], dtype=torch.float32)
+
+    tr = grid["edges"]["transformer"]
+    data["bus", "transformer", "bus"].edge_index = _ei(tr)
+    data["bus", "transformer", "bus"].edge_attr  = torch.tensor(tr["features"], dtype=torch.float32)
+
+    # ── bipartite link edges (no features) ────────────────────────────────────
+    data["generator", "generator_link", "bus"].edge_index = _ei(grid["edges"]["generator_link"])
+    data["load",      "load_link",      "bus"].edge_index = _ei(grid["edges"]["load_link"])
+    if shunt_feats:
+        data["shunt", "shunt_link", "bus"].edge_index = _ei(grid["edges"]["shunt_link"])
+
+    data.objective = record["metadata"]["objective"]
+    return data
+
+
+class ChunkedOPFDataset(torch.utils.data.Dataset):
+    """Flat dataset over case500 chunk .pt files (list[dict] → HeteroData on-the-fly).
+
+    Args:
+        chunk_dir: directory containing group_0.pt … group_N.pt files
+        groups:    list of group indices to load (e.g. list(range(4)) for train)
+        max_samples: if >0, truncate to this many examples
+    """
+
+    def __init__(self, chunk_dir: str, groups: list, max_samples: int = 0):
+        self._records: list = []
+        for g in groups:
+            path = _os.path.join(chunk_dir, f"group_{g}.pt")
+            if not _os.path.exists(path):
+                raise FileNotFoundError(f"[ChunkedOPFDataset] not found: {path}")
+            recs = torch.load(path, weights_only=False)
+            self._records.extend(recs)
+            print(f"[ChunkedOPFDataset] group {g}: {len(recs)} records "
+                  f"(total so far: {len(self._records)})", flush=True)
+        if max_samples and max_samples < len(self._records):
+            self._records = self._records[:max_samples]
+        print(f"[ChunkedOPFDataset] ready: {len(self._records)} records", flush=True)
+
+    def __len__(self):
+        return len(self._records)
+
+    def __getitem__(self, idx):
+        return json_to_heterodata(self._records[idx])
+
+
+def make_case500_loaders(chunk_dir: str, batch_size: int,
+                         n_train_groups: int = 4,
+                         max_train: int = 0, max_valid: int = 0, max_test: int = 0,
+                         num_workers: int = 0):
+    """Train/val/test loaders for case500 from pre-built chunk .pt files.
+
+    Split convention (20 groups × 15 K examples each = 300 K total):
+      train : groups 0 … n_train_groups-1   (default: 60 K with n_train_groups=4)
+      val   : group 18                       (15 K)
+      test  : group 19                       (15 K)
+    """
+    from torch.utils.data import DataLoader
+
+    tr = ChunkedOPFDataset(chunk_dir, list(range(n_train_groups)), max_train)
+    va = ChunkedOPFDataset(chunk_dir, [18], max_valid)
+    te = ChunkedOPFDataset(chunk_dir, [19], max_test)
+
+    mk = lambda d, sh: DataLoader(d, batch_size=batch_size, shuffle=sh,
+                                  collate_fn=collate_opfdata, num_workers=num_workers)
+    return mk(tr, True), mk(tr, False), mk(va, False), mk(te, False)
+
+
+# --------------------------------------------------------------------------- #
 # GridFM adapter (the only model without native OPFData support)
 # --------------------------------------------------------------------------- #
 

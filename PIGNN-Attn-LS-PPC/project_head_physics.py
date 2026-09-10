@@ -271,6 +271,8 @@ def parse_args():
     p.add_argument("--d_hi",         type=int, default=32)
     p.add_argument("--n_heads",      type=int, default=4)
     p.add_argument("--num_attn_layers", type=int, default=1)
+    p.add_argument("--chunk_dir", default="",
+                   help="case500 chunk dir; if set, uses ChunkedOPFDataset")
     return p.parse_args()
 
 
@@ -292,11 +294,19 @@ def main():
     model = load_model(args.ckpt, args.K, args.d, args.d_hi,
                        args.n_heads, args.num_attn_layers)
 
-    from opfdata_pipeline import make_opfdata_loaders
-    _, _, _, test_loader = make_opfdata_loaders(
-        args.opfdata_root, args.case_name, batch_size=1,
-        max_train=1, max_valid=1, max_test=S, num_workers=0,
-    )
+    if args.chunk_dir:
+        from opfdata_pipeline import make_case500_loaders
+        _, _, _, test_loader = make_case500_loaders(
+            args.chunk_dir, batch_size=1,
+            n_train_groups=1,
+            max_train=1, max_valid=1, max_test=S, num_workers=0,
+        )
+    else:
+        from opfdata_pipeline import make_opfdata_loaders
+        _, _, _, test_loader = make_opfdata_loaders(
+            args.opfdata_root, args.case_name, batch_size=1,
+            max_train=1, max_valid=1, max_test=S, num_workers=0,
+        )
 
     all_phys = {"|P_ij|": [], "|Q_ij|": [], "|Dθ_ij|": [], "|ΔV_ij|": []}
     for i, batch in enumerate(test_loader):
