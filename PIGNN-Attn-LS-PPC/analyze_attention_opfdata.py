@@ -57,7 +57,8 @@ def graph_diameter_and_eccentricity(edge_index: torch.Tensor, n_nodes: int):
 # ── model loading ────────────────────────────────────────────────────────────
 
 def load_model(ckpt_path: str, K: int, d: int, d_hi: int, n_heads: int,
-               num_attn_layers: int) -> "GNSMsg_EdgeSelfAttn_OPF":
+               num_attn_layers: int, use_global_attn: bool = False,
+               global_attn_position: str = "after") -> "GNSMsg_EdgeSelfAttn_OPF":
     from GNSMsg_SelfAttention_armijo_opf import GNSMsg_EdgeSelfAttn_OPF
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -69,6 +70,8 @@ def load_model(ckpt_path: str, K: int, d: int, d_hi: int, n_heads: int,
     model = GNSMsg_EdgeSelfAttn_OPF(
         d=d, d_hi=d_hi, K=K, n_heads=n_heads, num_attn_layers=num_attn_layers,
         pinn=True, use_armijo=True, armijo_mode="geometric_safe",
+        use_global_attn=use_global_attn,
+        global_attn_position=global_attn_position,
     )
     model.load_state_dict(state, strict=False)
     model.eval()
@@ -142,6 +145,9 @@ def parse_args():
     p.add_argument("--d_hi",         type=int, default=32)
     p.add_argument("--n_heads",      type=int, default=4)
     p.add_argument("--num_attn_layers", type=int, default=1)
+    p.add_argument("--use_global_attn", action="store_true", default=False)
+    p.add_argument("--global_attn_position", default="after",
+                   choices=("before", "after", "both"))
     p.add_argument("--chunk_dir", default="",
                    help="case500 chunk dir; if set, uses ChunkedOPFDataset instead of OPFDataset")
     return p.parse_args()
@@ -154,7 +160,9 @@ def main():
 
     print(f"[attn] Loading checkpoint: {args.ckpt}")
     model = load_model(args.ckpt, args.K, args.d, args.d_hi,
-                       args.n_heads, args.num_attn_layers)
+                       args.n_heads, args.num_attn_layers,
+                       use_global_attn=args.use_global_attn,
+                       global_attn_position=args.global_attn_position)
 
     print(f"[attn] Loading OPFData: {args.case_name}")
     if args.chunk_dir:

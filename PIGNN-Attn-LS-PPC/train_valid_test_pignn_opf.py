@@ -89,6 +89,18 @@ def parse_args():
                    choices=("fixed", "geometric", "geometric_safe", "reject"))
     p.add_argument("--dtheta_max", type=float, default=0.30)
     p.add_argument("--dvm_frac", type=float, default=0.10)
+    # global attention
+    p.add_argument("--use_global_attn", action="store_true", default=False,
+                   help="add a dense all-to-all attention block at each Newton step")
+    p.add_argument("--global_attn_position", default="after",
+                   choices=("before", "after", "both"),
+                   help="where to insert the global attention relative to local edge-attn")
+    p.add_argument("--attn_k_hop", type=int, default=1,
+                   help="expand local edge-attention graph to k-hop neighborhood (1=1-hop only)")
+    # partial-cost OPF curriculum
+    p.add_argument("--partial_cost_frac", type=float, default=0.0,
+                   help="fraction of controllable generators whose cost is randomly zeroed "
+                        "per batch (0=disabled); creates a free-dispatch curriculum")
     # loss weights
     p.add_argument("--mse_weight", type=float, default=1.0)
     p.add_argument("--pinn_weight", type=float, default=1e-2,
@@ -257,6 +269,9 @@ def run():
         n_heads=args.n_heads, num_attn_layers=args.num_attn_layers,
         dtheta_max=args.dtheta_max, dvm_frac=args.dvm_frac,
         physics_loss_form=args.physics_loss_form,
+        use_global_attn=args.use_global_attn,
+        global_attn_position=args.global_attn_position,
+        attn_k_hop=args.attn_k_hop,
     ).to(device)
     if args.resume_state_dict:
         model.load_state_dict(torch.load(args.resume_state_dict, map_location=device))
@@ -282,6 +297,19 @@ def run():
                       for k, v in batch.items() if k != "hetero"}
                 hb = batch["hetero"].to(device)
                 space = opf_decision_space(bd, batch["sizes"], device)
+                # Partial-cost curriculum: randomly zero cost coefficients for a
+                # fraction of controllable generators so the model learns OPF
+                # with "free dispatch" generators mixed in.
+                if train and args.partial_cost_frac > 0.0:
+                    ctrl_idx = space["Gen_controllable"].nonzero(as_tuple=False).squeeze(-1)
+                    n_drop = int(len(ctrl_idx) * args.partial_cost_frac)
+                    if n_drop > 0:
+                        perm = torch.randperm(len(ctrl_idx), device=device)[:n_drop]
+                        drop = ctrl_idx[perm]
+                        for key in ("Gen_cost_c1", "Gen_cost_c2"):
+                            if key in space:
+                                space[key] = space[key].clone()
+                                space[key][drop] = 0.0
                 Y = bd["Ybus"]; S_load = bd["S_start"]
                 target = bd["V_newton"].float()
                 n = target.shape[1]

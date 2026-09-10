@@ -42,6 +42,7 @@ from GNSMsg_SelfAttention_armijo import (
     GNSMsg_EdgeSelfAttn,
     _build_dense_Y_from_branchrows_single,
     _build_directed_edges_single,
+    _expand_to_k_hop,
 )
 
 
@@ -92,8 +93,9 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
         vn_log=None,
         v_min=None,             # per-bus band; falls back to the parent's scalars
         v_max=None,
-        return_attn=False,      # if True, return collected attention weights
-        return_attn_heads=False,# if True, keep per-head (E,H); else mean over heads (E,)
+        return_attn=False,       # if True, return local edge attention weights
+        return_attn_heads=False, # if True, keep per-head (E,H); else mean over heads (E,)
+        return_global_attn=False,# if True (and use_global_attn), also return global (N,N) weights
     ):
         device = bus_type.device
         B, N = bus_type.shape
@@ -130,6 +132,18 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
         # The edge features inherit the branch rows' float64; the attention
         # blocks are float32. Cast once here rather than at every block.
         edge_feat_dir = edge_feat_dir.to(V0.dtype)
+
+        # Expand 1-hop edges to k-hop neighborhood (supervisor: 2–4 hops).
+        # New k-hop edges get zero edge features so they carry no branch-physics
+        # signal but still let attention propagate over multi-hop paths.
+        if self.attn_k_hop > 1:
+            n_orig = edge_index_dir.shape[0]      # edge_index_dir is (E, 2)
+            ei_khop = _expand_to_k_hop(edge_index_dir, N, self.attn_k_hop)  # (E', 2)
+            n_new = ei_khop.shape[0] - n_orig
+            if n_new > 0:
+                zero_feats = edge_feat_dir.new_zeros(n_new, edge_feat_dir.shape[1])
+                edge_index_dir = ei_khop
+                edge_feat_dir = torch.cat([edge_feat_dir, zero_feats], dim=0)
 
         # The pipeline carries Y and S in complex128 while the network state is
         # float32, and torch will not mix the two in matmul. Align them on the
@@ -177,7 +191,9 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
             v_max = torch.full_like(v, 1.20)
 
         phys_terms = []
-        collected_attn = []  # list of (E, H) tensors, one per step
+        collected_attn = []         # list[K] of (E,H) or (E,) — local edge attention
+        collected_global_attn = []  # list[K] of (H,N,N) — global attention (if enabled)
+        _do_global = self.use_global_attn and return_global_attn
 
         for k in range(self.K):
             Vc = v * torch.exp(1j * th)
@@ -196,6 +212,16 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
                 bus_feat = torch.cat([bus_feat, extra], dim=-1)
             x = self.in_proj(torch.cat([bus_feat, m], dim=-1))
 
+            # ── optional pre-local global attention ───────────────────────────
+            if self.use_global_attn and self.global_attn_position in ("before", "both"):
+                blk_pre = self.global_block_pre if self.global_attn_position == "both" else self.global_block
+                if _do_global and self.global_attn_position == "before":
+                    x, gw = blk_pre(x, return_attn=True)
+                    collected_global_attn.append(gw[0].detach().cpu())   # (H, N, N)
+                else:
+                    x = blk_pre(x)
+
+            # ── local edge self-attention ─────────────────────────────────────
             step_alpha = None
             for blk in self.blocks:
                 if return_attn:
@@ -205,6 +231,14 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
             if return_attn and step_alpha is not None:
                 raw = step_alpha[0].detach().cpu()  # (E, H)
                 collected_attn.append(raw if return_attn_heads else raw.mean(dim=-1))
+
+            # ── optional post-local global attention ──────────────────────────
+            if self.use_global_attn and self.global_attn_position in ("after", "both"):
+                if _do_global:
+                    x, gw = self.global_block(x, return_attn=True)
+                    collected_global_attn.append(gw[0].detach().cpu())   # (H, N, N)
+                else:
+                    x = self.global_block(x)
 
             dth = self.theta_head[k](x).squeeze(-1)
             dv = self.v_head[k](x).squeeze(-1)
@@ -288,9 +322,14 @@ class GNSMsg_EdgeSelfAttn_OPF(GNSMsg_EdgeSelfAttn):
                 DQ = (Q_set - Sc.imag) * enforce_q.to(Q_set.dtype)
                 phys_terms.append(self.physics_final_weight * self._physics_residual_loss(
                     DP, DQ, P_set, Q_set, enforce_p, enforce_q, n_nodes_per_graph))
+            phys_loss = torch.sum(torch.stack(phys_terms))
             if return_attn:
-                return out, torch.sum(torch.stack(phys_terms)), collected_attn, edge_index_dir.cpu()
-            return out, torch.sum(torch.stack(phys_terms))
+                if return_global_attn and collected_global_attn:
+                    return out, phys_loss, collected_attn, edge_index_dir.cpu(), collected_global_attn
+                return out, phys_loss, collected_attn, edge_index_dir.cpu()
+            return out, phys_loss
         if return_attn:
+            if return_global_attn and collected_global_attn:
+                return out, None, collected_attn, edge_index_dir.cpu(), collected_global_attn
             return out, None, collected_attn, edge_index_dir.cpu()
         return out

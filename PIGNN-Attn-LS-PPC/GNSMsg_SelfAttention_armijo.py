@@ -128,6 +128,32 @@ def _normalize_per_graph(grad_vm, grad_va, n_nodes_per_graph=None):
     return torch.cat(vm_parts, dim=1), torch.cat(va_parts, dim=1)
 
 
+def _expand_to_k_hop(edge_index: torch.Tensor, n_nodes: int, k: int) -> torch.Tensor:
+    """Augment a directed edge list with all k-hop (multi-hop) connections.
+
+    Returns (E', 2) with the original 1-hop edges PLUS synthetic k-hop edges
+    (up to hop k).  Self-loops are excluded.  New edges have zero edge features
+    in the caller (the model learns to distinguish them by their zero bias).
+    """
+    if k <= 1:
+        return edge_index
+    device = edge_index.device
+    N = n_nodes
+    E = edge_index.shape[0]
+    vals = torch.ones(E, dtype=torch.float32, device=device)
+    # Build adjacency as dense bool matrix (N≤500 is fine on A100)
+    A = torch.zeros(N, N, dtype=torch.float32, device=device)
+    A[edge_index[:, 0], edge_index[:, 1]] = 1.0
+    A_reach = A.clone()
+    A_k = A.clone()
+    for _ in range(2, k + 1):
+        A_k = torch.mm(A_k, A).clamp(0, 1)
+        A_reach = (A_reach + A_k).clamp(0, 1)
+    A_reach.fill_diagonal_(0)
+    new_ei = A_reach.nonzero(as_tuple=False)   # (E', 2) — all paths within k hops
+    return new_ei
+
+
 def _build_dense_Y_from_branchrows_single(
     N: int,
     Branch_f_bus: torch.Tensor,
@@ -256,7 +282,53 @@ def _build_directed_edges_single(
     return edge_index, edge_feat
 
 
-# --------------------- attention block -----------------------
+# --------------------- attention blocks ----------------------
+
+class GlobalAttnBlock(nn.Module):
+    """Dense (all-to-all) multi-head self-attention over N bus nodes.
+
+    Placed before or after the sparse EdgeSelfAttnBlock to capture
+    long-range dependencies that a single local message-passing step
+    cannot propagate.  At case118 scale (N=118) this costs 118²×H
+    ≈ 56 K floats per head per step — negligible on A100.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout,
+                                          batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+        )
+        self.drop = nn.Dropout(dropout)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, return_attn: bool = False):
+        """x: (B, N, D) → (B, N, D).
+
+        Returns (out, attn_weights) when return_attn=True.
+        attn_weights: (B, n_heads, N, N), rows sum to 1 per query node.
+        """
+        y = self.ln1(x)
+        attn_out, w = self.attn(y, y, y,
+                                need_weights=return_attn,
+                                average_attn_weights=False)
+        x = x + self.drop(attn_out)
+        z = self.drop(self.ffn(self.ln2(x)))
+        out = x + z
+        if return_attn:
+            return out, w          # w: (B, H, N, N)
+        return out
+
 
 class EdgeSelfAttnBlock(nn.Module):
     """
@@ -357,6 +429,9 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         bus_feat_extra_dim: int = 0,
         dtheta_max: float = 0.30,
         dvm_frac: float = 0.10,
+        use_global_attn: bool = False,
+        global_attn_position: str = "after",   # "before" | "after" | "both"
+        attn_k_hop: int = 1,                   # expand local edges to k-hop neighborhood
         physics_loss_form: str = "mse",
         physics_residual_norm: str = "none",
         physics_norm_eps: float = 1e-6,
@@ -421,6 +496,11 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         self.n_heads = n_heads
         assert self.d_model % self.n_heads == 0
         self.num_attn_layers = num_attn_layers
+        self.attn_k_hop = max(1, int(attn_k_hop))
+        self.use_global_attn = use_global_attn
+        if global_attn_position not in ("before", "after", "both"):
+            raise ValueError(f"global_attn_position must be 'before', 'after', or 'both'; got {global_attn_position!r}")
+        self.global_attn_position = global_attn_position
 
         self.bus_feat_extra_dim = int(bus_feat_extra_dim)
         # The integrated solver exposes the exact polar AC-PF gradient to the
@@ -441,6 +521,11 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
             )
             for _ in range(self.num_attn_layers)
         ])
+        if use_global_attn:
+            # One global block; "both" uses a pre-block and a post-block.
+            self.global_block = GlobalAttnBlock(self.d_model, n_heads, dropout=attn_dropout)
+            if global_attn_position == "both":
+                self.global_block_pre = GlobalAttnBlock(self.d_model, n_heads, dropout=attn_dropout)
 
         self.theta_head = nn.ModuleList([nn.Linear(self.d_model, 1) for _ in range(K)])
         self.v_head     = nn.ModuleList([nn.Linear(self.d_model, 1) for _ in range(K)])
