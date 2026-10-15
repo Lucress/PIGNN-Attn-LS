@@ -67,6 +67,8 @@ venv/
 # LVN planning docs
 /PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/RESEARCH_DIRECTION.md
 /PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/UNDERSTANDING.md
+# Master's project documents — local only
+/PIGNN-Attn-LS-PPC/Master'sProject/
 # exclude the contents (not the directory itself) so the negation below applies
 /ScenarioSynthesis_PPC/out/*
 # ...but keep the inspection helpers that live next to the generated parquet
