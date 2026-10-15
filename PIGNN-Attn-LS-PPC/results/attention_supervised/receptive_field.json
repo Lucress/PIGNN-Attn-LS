@@ -1,0 +1,27 @@
+{
+  "case": "pglib_opf_case14_ieee",
+  "n_buses": 14,
+  "n_edges_directed": 40,
+  "n_edges_undirected": 20,
+  "graph_diameter": 5,
+  "graph_radius": 3,
+  "K": 15,
+  "K_covers_diameter": true,
+  "eccentricity_per_bus": [
+    4,
+    3,
+    4,
+    3,
+    3,
+    4,
+    4,
+    5,
+    3,
+    4,
+    4,
+    5,
+    4,
+    4
+  ],
+  "interpretation": "K=15 correction steps vs graph diameter=5. K >= diameter: every bus pair can exchange information."
+}

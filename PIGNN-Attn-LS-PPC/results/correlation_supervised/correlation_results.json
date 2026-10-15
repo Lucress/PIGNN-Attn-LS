@@ -1,0 +1,15 @@
+{
+  "label": "Supervised (AC-OPF)",
+  "n_scenarios": 30,
+  "n_nodes": 14,
+  "K": 15,
+  "r_attn_flow": -0.345958203943535,
+  "p_attn_flow": 4.5560008052747714e-35,
+  "r_attn_vdev": 0.04491537657530303,
+  "p_attn_vdev": 0.35850817499184384,
+  "mean_attn_by_type": {
+    "slack": 1.0,
+    "gen": 1.0,
+    "load": 1.0
+  }
+}

@@ -333,16 +333,32 @@ class GlobalAttnBlock(nn.Module):
 class EdgeSelfAttnBlock(nn.Module):
     """
     Sparse graph self-attention with edge bias.
+
+    attn_rank > 0 activates low-rank Q/K projections:
+      W_Q = A_Q @ B_Q  (d_model→rank→d_model)
+    This exploits the low-dimensional manifold structure of AC-OPF solutions
+    (supervisor direction: rank=16 to match OPF solution manifold dimension).
     """
-    def __init__(self, d_model: int, n_heads: int, edge_feat_dim: int, ffn_hidden: int = None, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, edge_feat_dim: int,
+                 ffn_hidden: int = None, dropout: float = 0.0,
+                 attn_rank: int = 0):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.h = n_heads
         self.dh = d_model // n_heads
+        self.attn_rank = attn_rank
 
-        self.q = nn.Linear(d_model, d_model, bias=False)
-        self.k = nn.Linear(d_model, d_model, bias=False)
+        if attn_rank > 0 and attn_rank < d_model:
+            # Low-rank Q and K: W = A @ B, A: d_model→rank, B: rank→d_model
+            self.q_A = nn.Linear(d_model, attn_rank, bias=False)
+            self.q_B = nn.Linear(attn_rank, d_model, bias=False)
+            self.k_A = nn.Linear(d_model, attn_rank, bias=False)
+            self.k_B = nn.Linear(attn_rank, d_model, bias=False)
+        else:
+            self.q = nn.Linear(d_model, d_model, bias=False)
+            self.k = nn.Linear(d_model, d_model, bias=False)
+
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
@@ -377,8 +393,12 @@ class EdgeSelfAttnBlock(nn.Module):
         dst = edge_index_dir[:, 1]
 
         y = self.ln1(x)
-        Q = self.q(y).view(B, N, self.h, self.dh)
-        K = self.k(y).view(B, N, self.h, self.dh)
+        if self.attn_rank > 0 and self.attn_rank < self.d_model:
+            Q = self.q_B(self.q_A(y)).view(B, N, self.h, self.dh)
+            K = self.k_B(self.k_A(y)).view(B, N, self.h, self.dh)
+        else:
+            Q = self.q(y).view(B, N, self.h, self.dh)
+            K = self.k(y).view(B, N, self.h, self.dh)
         V = self.v(y).view(B, N, self.h, self.dh)
 
         Qi = Q[:, dst, :, :]
@@ -432,6 +452,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         use_global_attn: bool = False,
         global_attn_position: str = "after",   # "before" | "after" | "both"
         attn_k_hop: int = 1,                   # expand local edges to k-hop neighborhood
+        attn_rank: int = 0,                    # 0=full-rank; >0 uses low-rank Q/K (e.g. 16)
         physics_loss_form: str = "mse",
         physics_residual_norm: str = "none",
         physics_norm_eps: float = 1e-6,
@@ -511,13 +532,15 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         self.edge_feat_dim = 9   # <-- now includes tau + theta + is_trafo
 
         self.in_proj = nn.Linear(self.bus_feat_dim, self.d_model)
+        self.attn_rank = attn_rank
         self.blocks = nn.ModuleList([
             EdgeSelfAttnBlock(
                 self.d_model,
                 self.n_heads,
                 self.edge_feat_dim,
                 ffn_hidden=4 * self.d_model,
-                dropout=attn_dropout
+                dropout=attn_dropout,
+                attn_rank=attn_rank,
             )
             for _ in range(self.num_attn_layers)
         ])

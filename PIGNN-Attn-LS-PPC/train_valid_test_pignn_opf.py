@@ -53,7 +53,8 @@ from GNSMsg_SelfAttention_armijo import _build_dense_Y_from_branchrows_single
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--case_name", default="pglib_opf_case14_ieee")
-    p.add_argument("--opfdata_root", required=True)
+    p.add_argument("--opfdata_root", default="",
+                   help="root dir for PyG OPFData; required unless --chunk_dir is set")
     p.add_argument("--num_groups", type=int, default=1)
     p.add_argument("--topological_perturbations", action="store_true")
     p.add_argument("--run_name", default="")
@@ -97,6 +98,8 @@ def parse_args():
                    help="where to insert the global attention relative to local edge-attn")
     p.add_argument("--attn_k_hop", type=int, default=1,
                    help="expand local edge-attention graph to k-hop neighborhood (1=1-hop only)")
+    p.add_argument("--attn_rank", type=int, default=0,
+                   help="low-rank Q/K projection rank (0=full-rank, 16=exploit OPF low-dim structure)")
     # partial-cost OPF curriculum
     p.add_argument("--partial_cost_frac", type=float, default=0.0,
                    help="fraction of controllable generators whose cost is randomly zeroed "
@@ -107,10 +110,37 @@ def parse_args():
                    help="weight on the solver's own unrolled physics residual")
     p.add_argument("--physics_weight", type=float, default=1e-2,
                    help="weight on opf_task.opf_loss (balance + limit violation)")
+    p.add_argument("--cost_weight", type=float, default=0.0,
+                   help="weight on generation dispatch cost (differentiable via implied injection)")
     p.add_argument("--physics_loss_form", default="logcosh",
                    choices=("mse", "huber", "logcosh"))
-    p.add_argument("--opf_limit_weight", type=float, default=1.0)
+    p.add_argument("--opf_balance_weight", type=float, default=1.0,
+                   help="weight on P/Q balance term inside opf_loss")
+    p.add_argument("--opf_limit_weight", type=float, default=1.0,
+                   help="weight on generator P/Q limit violation inside opf_loss")
     p.add_argument("--opf_band_weight", type=float, default=0.0)
+    # Primal-Dual Learning (PDL): adaptive Lagrange multipliers
+    p.add_argument("--use_pdl", action="store_true",
+                   help="replace fixed opf_balance/limit weights with adaptive dual variables")
+    p.add_argument("--pdl_lr",     type=float, default=0.01,
+                   help="dual ascent step size (used for both balance and limit if specific rates not set)")
+    p.add_argument("--pdl_lr_bal", type=float, default=0.0,
+                   help="dual ascent step for power-balance multiplier (overrides --pdl_lr if >0)")
+    p.add_argument("--pdl_lr_lim", type=float, default=0.0,
+                   help="dual ascent step for P/Q-limit multiplier (overrides --pdl_lr if >0)")
+    p.add_argument("--pdl_clip", type=float, default=100.0,
+                   help="maximum value for PDL multipliers (prevents runaway)")
+    # XAI-guided regularizer: L2 penalty on known always-zero generators
+    p.add_argument("--xai_pen_buses", type=int, nargs="*", default=[],
+                   help="1-indexed bus numbers whose predicted gen_p is penalized "
+                        "(XAI finding: these generators are always OFF in optimal dispatch)")
+    p.add_argument("--xai_pen_weight", type=float, default=0.0,
+                   help="weight on XAI-guided L2 gen_p penalty (0=disabled)")
+    p.add_argument("--xai_pen_top_frac", type=float, default=0.0,
+                   help="auto-detect always-zero generators via merit order: "
+                        "top-frac of ctrl generators ranked by c1+c2*Pmax "
+                        "(marginal cost at full capacity); merges with --xai_pen_buses; "
+                        "0=disabled  example: 0.05 picks top-5 percent most expensive")
     return p.parse_args()
 
 
@@ -224,6 +254,35 @@ def validate_branch_rows(hetero, device) -> Dict[str, float]:
 
 # --------------------------------------------------------------------------- #
 
+def compute_merit_order_buses(first_batch, top_frac):
+    """Rank ctrl generators by marginal cost (c1 + c2*Pmax) — merit order.
+
+    Returns 1-indexed bus numbers of the top-frac most expensive generators.
+    These are structurally always-zero in optimal dispatch when cheaper
+    generators have enough capacity to cover the entire load range.
+    """
+    # Batch tensors have shape (1, B*n_nodes); take only first graph's n_nodes
+    n_nodes = int(first_batch["sizes"][0].item())
+    c1   = first_batch["Gen_cost_c1"].squeeze(0).float()[:n_nodes]
+    c2_t = first_batch.get("Gen_cost_c2")
+    c2   = c2_t.squeeze(0).float()[:n_nodes] if c2_t is not None else torch.zeros_like(c1)
+    pm_t = first_batch.get("Gen_p_max")
+    pmax = pm_t.squeeze(0).float()[:n_nodes] if pm_t is not None else torch.ones_like(c1)
+    ctrl = (first_batch["Gen_controllable"].squeeze(0)[:n_nodes] > 0)
+
+    # Marginal cost at full capacity: MC(Pmax) = c1 + 2*c2*Pmax
+    # (quadratic cost C(p)=c2*p²+c1*p, so MC=2*c2*p+c1)
+    # For ranking, the factor of 2 cancels so we use c1 + c2*Pmax
+    mc = c1 + c2 * pmax
+
+    ctrl_idx = ctrl.nonzero(as_tuple=False).squeeze(-1)  # 0-indexed positions
+    mc_ctrl  = mc[ctrl_idx]
+    n_top = max(1, int(len(ctrl_idx) * top_frac))
+    _, order = mc_ctrl.sort(descending=True)
+    top_0 = ctrl_idx[order[:n_top]].tolist()
+    return sorted(int(i) + 1 for i in top_0)  # 1-indexed bus numbers
+
+
 def run():
     args = parse_args()
     set_seed(args.seed_value)
@@ -234,6 +293,9 @@ def run():
         f = open(os.path.join(args.log_dir, f"{args.run_name}_training_log.txt"),
                  "a", buffering=1)
         sys.stdout = Tee(sys.stdout, f)
+
+    if not args.chunk_dir and not args.opfdata_root:
+        raise SystemExit("error: --opfdata_root is required when --chunk_dir is not set")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[run] {args.run_name}")
@@ -272,6 +334,7 @@ def run():
         use_global_attn=args.use_global_attn,
         global_attn_position=args.global_attn_position,
         attn_k_hop=args.attn_k_hop,
+        attn_rank=args.attn_rank,
     ).to(device)
     if args.resume_state_dict:
         model.load_state_dict(torch.load(args.resume_state_dict, map_location=device))
@@ -283,10 +346,32 @@ def run():
                               weight_decay=args.weight_decay)
     best_val = float("inf")
     best_path = os.path.join(args.ckpt_dir, f"{args.run_name}_best.pt")
+    best_feas = float("inf")   # min(max(P-limit, dp_inf)) across val epochs
+    best_feas_path = os.path.join(args.ckpt_dir, f"{args.run_name}_best_feas.pt")
+
+    # PDL: mutable lists so the closure inside run_epoch can read the live value
+    lam_bal = [args.opf_balance_weight]
+    lam_lim = [args.opf_limit_weight]
+    _pdl_lr_bal = args.pdl_lr_bal if args.pdl_lr_bal > 0 else args.pdl_lr
+    _pdl_lr_lim = args.pdl_lr_lim if args.pdl_lr_lim > 0 else args.pdl_lr
+    if args.use_pdl:
+        print(f"[PDL] enabled — lr_bal={_pdl_lr_bal}  lr_lim={_pdl_lr_lim}  clip={args.pdl_clip}  "
+              f"init lam_bal={lam_bal[0]}  lam_lim={lam_lim[0]}")
+
+    # Merit-order auto-detection of always-zero generators
+    if args.xai_pen_top_frac > 0:
+        _first_batch = next(iter(train_loader))
+        mo_buses = compute_merit_order_buses(_first_batch, args.xai_pen_top_frac)
+        args.xai_pen_buses = sorted(set(args.xai_pen_buses) | set(mo_buses))
+        print(f"[XAI-pen] merit-order top {args.xai_pen_top_frac:.1%} of ctrl generators "
+              f"-> auto-detected buses {mo_buses}")
+    if args.xai_pen_buses:
+        print(f"[XAI-pen] penalizing gen_p at 1-indexed buses {args.xai_pen_buses}  "
+              f"weight={args.xai_pen_weight}")
 
     def run_epoch(loader, train, collect_residuals=False):
         model.train(train)
-        sums = {"loss": 0.0, "mse": 0.0, "mse_mag": 0.0, "mse_ang": 0.0, "phys": 0.0}
+        sums = {"loss": 0.0, "mse": 0.0, "mse_mag": 0.0, "mse_ang": 0.0, "phys": 0.0, "cost": 0.0, "xai_pen": 0.0}
         opf_sums: Dict[str, float] = {}
         dp_chunks, dq_chunks = [], []
         n_graphs = 0
@@ -349,11 +434,29 @@ def run():
                 mse_mag = torch.mean(dmag * dmag); mse_ang = torch.mean(dang * dang)
                 mse = mse_mag + mse_ang
                 phys = opf_loss(Y, V, S_load, space,
-                                limit_weight=args.opf_limit_weight,
+                                balance_weight=lam_bal[0],
+                                limit_weight=lam_lim[0],
                                 band_weight=args.opf_band_weight,
                                 form=args.physics_loss_form)
+                from opf_task import opf_residual_and_violation, dispatch_cost
+                _need_parts = args.cost_weight > 0 or (args.xai_pen_weight > 0 and args.xai_pen_buses)
+                if _need_parts:
+                    _parts = opf_residual_and_violation(Y, V, S_load, space)
+                else:
+                    _parts = None
+                cost_loss = (dispatch_cost(_parts["gen_p"].to(torch.float32), space)
+                             if args.cost_weight > 0 else torch.zeros((), device=device))
+                if args.xai_pen_weight > 0 and args.xai_pen_buses:
+                    # gen_p shape: (B * n_nodes,); n = B * n_nodes from target.shape[1]
+                    _gen_p_2d = _parts["gen_p"].float().view(B, n // B)
+                    _xai_idx = [b - 1 for b in args.xai_pen_buses]
+                    xai_pen_loss = _gen_p_2d[:, _xai_idx].pow(2).mean()
+                else:
+                    xai_pen_loss = torch.zeros((), device=device)
                 loss = (args.mse_weight * mse + args.physics_weight * phys
-                        + args.pinn_weight * pinn_loss)
+                        + args.pinn_weight * pinn_loss
+                        + args.cost_weight * cost_loss
+                        + args.xai_pen_weight * xai_pen_loss)
 
                 if train:
                     optim.zero_grad(set_to_none=True)
@@ -371,7 +474,8 @@ def run():
                         dp_chunks.append(r["dp"][free].detach().float().cpu())
                         dq_chunks.append(r["dq"][free].detach().float().cpu())
                 for k, v_ in (("loss", loss), ("mse", mse), ("mse_mag", mse_mag),
-                              ("mse_ang", mse_ang), ("phys", phys)):
+                              ("mse_ang", mse_ang), ("phys", phys), ("cost", cost_loss),
+                              ("xai_pen", xai_pen_loss)):
                     sums[k] += float(v_.item()) * B
         d = max(n_graphs, 1)
         out_d = {k: v / d for k, v in sums.items()}
@@ -417,22 +521,41 @@ def run():
     for epoch in range(1, args.EPOCHS + 1):
         t0 = time.time()
         tr = run_epoch(train_loader, train=True)
+        if args.use_pdl:
+            lam_bal[0] = min(args.pdl_clip, max(0.0,
+                lam_bal[0] + _pdl_lr_bal * tr["opf"]["dp_inf_pu"]))
+            lam_lim[0] = min(args.pdl_clip, max(0.0,
+                lam_lim[0] + _pdl_lr_lim * tr["opf"]["p_limit_max_pu"]))
         if epoch % args.VAL_EVERY == 0 or epoch == args.EPOCHS:
             va = run_epoch(val_loader, train=False)
-            print(f"Epoch {epoch:3d} | {fmt('train', tr)} | {fmt('valid', va)} "
-                  f"| time {time.time()-t0:.2f}s")
+            pdl_str = f" | λbal={lam_bal[0]:.2f} λlim={lam_lim[0]:.2f}" if args.use_pdl else ""
+            print(f"Epoch {epoch:3d} | {fmt('train', tr)} | {fmt('valid', va)}"
+                  f"{pdl_str} | time {time.time()-t0:.2f}s")
             if va["loss"] < best_val:
                 best_val = va["loss"]
                 tmp_path = best_path + ".tmp"
                 torch.save(model.state_dict(), tmp_path)
                 os.replace(tmp_path, best_path)
                 print(f"  checkpoint saved to {best_path}")
+            feas_proxy = max(va["opf"].get("p_limit_max_pu", 0.0),
+                             va["opf"].get("dp_inf_pu", 0.0))
+            if feas_proxy < best_feas:
+                best_feas = feas_proxy
+                tmp_path = best_feas_path + ".tmp"
+                torch.save(model.state_dict(), tmp_path)
+                os.replace(tmp_path, best_feas_path)
+                print(f"  checkpoint (feas proxy={feas_proxy:.4e}) saved to {best_feas_path}")
         else:
-            print(f"Epoch {epoch:3d} | {fmt('train', tr)} | time {time.time()-t0:.2f}s")
+            pdl_str = f" | λbal={lam_bal[0]:.2f} λlim={lam_lim[0]:.2f}" if args.use_pdl else ""
+            print(f"Epoch {epoch:3d} | {fmt('train', tr)}{pdl_str} | time {time.time()-t0:.2f}s")
 
-    if os.path.exists(best_path):
-        model.load_state_dict(torch.load(best_path, map_location=device))
-        print(f"[test] loaded best checkpoint: {best_path}")
+    # For PDL runs prefer the feasibility checkpoint; fall back to loss checkpoint.
+    load_path = (best_feas_path
+                 if args.use_pdl and os.path.exists(best_feas_path)
+                 else best_path)
+    if os.path.exists(load_path):
+        model.load_state_dict(torch.load(load_path, map_location=device))
+        print(f"[test] loaded checkpoint: {load_path}")
     te = run_epoch(test_loader, train=False, collect_residuals=True)
     rmse = math.sqrt(max(te["mse"], 0.0))
     rmag = math.sqrt(max(te["mse_mag"], 0.0))

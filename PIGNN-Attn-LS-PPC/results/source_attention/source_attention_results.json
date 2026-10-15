@@ -1,0 +1,36 @@
+{
+  "supervised": {
+    "top3_source_buses_1idx": [
+      8,
+      11,
+      13
+    ],
+    "top3_dest_buses_1idx": [
+      8,
+      10,
+      1
+    ],
+    "mean_source_by_type": {
+      "slack": 0.05928284302353859,
+      "gen": 0.0767052099108696,
+      "load": 0.07043293863534927
+    }
+  },
+  "pinn": {
+    "top3_source_buses_1idx": [
+      13,
+      11,
+      8
+    ],
+    "top3_dest_buses_1idx": [
+      8,
+      12,
+      3
+    ],
+    "mean_source_by_type": {
+      "slack": 0.04932750388979912,
+      "gen": 0.0686798244714737,
+      "load": 0.07510590553283691
+    }
+  }
+}

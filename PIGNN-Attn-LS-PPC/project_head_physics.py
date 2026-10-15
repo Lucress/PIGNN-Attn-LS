@@ -75,7 +75,8 @@ def spearman(x, y):
 
 # ── model + inference ─────────────────────────────────────────────────────────
 
-def load_model(ckpt, K, d, d_hi, n_heads, num_attn_layers=1):
+def load_model(ckpt, K, d, d_hi, n_heads, num_attn_layers=1,
+               use_global_attn=False, global_attn_position="after", attn_k_hop=1):
     from GNSMsg_SelfAttention_armijo_opf import GNSMsg_EdgeSelfAttn_OPF
     data  = torch.load(ckpt, map_location="cpu", weights_only=False)
     state = data.get("model_state_dict", data)
@@ -83,6 +84,9 @@ def load_model(ckpt, K, d, d_hi, n_heads, num_attn_layers=1):
         d=d, d_hi=d_hi, K=K, n_heads=n_heads,
         num_attn_layers=num_attn_layers,
         pinn=True, use_armijo=True, armijo_mode="geometric_safe",
+        use_global_attn=use_global_attn,
+        global_attn_position=global_attn_position,
+        attn_k_hop=attn_k_hop,
     )
     model.load_state_dict(state, strict=False)
     model.eval()
@@ -271,6 +275,11 @@ def parse_args():
     p.add_argument("--d_hi",         type=int, default=32)
     p.add_argument("--n_heads",      type=int, default=4)
     p.add_argument("--num_attn_layers", type=int, default=1)
+    p.add_argument("--use_global_attn", action="store_true", default=False)
+    p.add_argument("--global_attn_position", default="after",
+                   choices=("before", "after", "both"))
+    p.add_argument("--attn_k_hop", type=int, default=1)
+    p.add_argument("--partial_cost_frac", type=float, default=0.0)
     p.add_argument("--chunk_dir", default="",
                    help="case500 chunk dir; if set, uses ChunkedOPFDataset")
     return p.parse_args()
@@ -292,7 +301,10 @@ def main():
     # run inference to get predicted voltages per scenario
     print(f"[hp] Loading model + running AC-OPF inference ...")
     model = load_model(args.ckpt, args.K, args.d, args.d_hi,
-                       args.n_heads, args.num_attn_layers)
+                       args.n_heads, args.num_attn_layers,
+                       use_global_attn=args.use_global_attn,
+                       global_attn_position=args.global_attn_position,
+                       attn_k_hop=args.attn_k_hop)
 
     if args.chunk_dir:
         from opfdata_pipeline import make_case500_loaders

@@ -1,0 +1,107 @@
+# OPF (Optimal Power Flow) training config for PIGNN-Attn-LS.
+#
+# Model 2: physics-informed PIGNN-OPF (no labeled OPF solutions required).
+#
+# Loss = lambda_cost × gen_cost            [economic objective]
+#       + lambda_kcl    × KCL_mismatch     [power balance — highest priority]
+#       + lambda_lim    × gen_limit_viol   [generator capacity]
+#       + lambda_branch × branch_thermal   [line thermal limits]
+#       + lambda_v      × voltage_soft     [voltage band, pre-clamp]
+#
+# Calibration (after normalization fix — all terms now per-graph scale):
+#   init gen_cost ≈ 1.1 pu/graph  → lambda_cost × 1.1
+#   init kcl_loss ≈ 0.6 pu/node   → lambda_kcl  × 0.6
+#   Setting lambda_kcl = 5 makes kcl contribute ~3× gen_cost,
+#   forcing the model to prioritise KCL feasibility over optimality.
+#
+# Pass any field on the CLI to override, e.g.:
+#   python -m train --config configs/opf_pignn_attn_ls.yaml --EPOCHS 200
+
+run:
+  name: null
+  mode: train_test
+  seed: 42
+
+split:
+  mode: ratio
+  train_ratio: 0.80
+  valid_ratio: 0.10
+
+data:
+  # Synthetic 5-bus ring dataset (2000 samples).
+  # Replace with your real parquet dataset when available.
+  parquet_paths:
+    - ./datasets/synthetic_opf_n5_ring.parquet
+  per_unit: false   # synthetic data is already in pu (U_base=S_base=1)
+
+flags:
+  pinn: true          # must be true for OPF loss accumulation
+  block_diag: true
+  normalize: false
+  mag_ang_mse: false
+  float64: false
+
+model:
+  name: GNSMsg_EdgeSelfAttn_OPF
+
+  # GNN dimensions
+  d: 4
+  d_hi: 16
+  num_attn_layers: 1
+  K: 15              # 15 correction iterations per forward pass
+  gamma: 0.95        # discount factor (higher → deeper gradient flow)
+  vlimit: true
+  use_armijo: true
+  DthetaMax: 0.30
+  DvmFrac: 0.10
+
+  # ── Loss weights ──────────────────────────────────────────────────────────
+  # Principle: KCL dominates (feasibility first), then economic cost.
+  # After normalization fix, gen_cost ≈ 1.1 and kcl ≈ 0.6 at init.
+  # lambda_kcl=5 → kcl contributes ~3× more than gen_cost in the loss.
+  #
+  # Phase A fix: lambda_kcl_inf=20 adds a direct worst-node (L∞) penalty.
+  # The L2 loss drives average KCL down; the L∞ term prevents any single node
+  # from holding KCL L∞ above the 0.05 pu feasibility threshold.
+  # Value chosen from ablation sweep (linf_w10 / linf_w20 optimal range).
+  lambda_cost:    1.0   # economic objective (primary OPF goal)
+  lambda_kcl:     5.0   # KCL L2: average mismatch
+  lambda_kcl_inf: 20.0  # KCL L∞: worst-node mismatch (Phase A addition)
+  lambda_lim:    20.0   # generator capacity limits (hard enforcement)
+  lambda_branch:  2.0   # branch thermal limits
+  lambda_v:       2.0   # soft voltage limits (pre-clamp excess)
+
+  # ── Dispatch control ──────────────────────────────────────────────────────
+  pg_step_frac: 0.05   # max ΔPg per iteration = 5% of [Pg_min, Pg_max] range
+  c1_default:   2.0    # linear cost coeff   (pu_cost / pu_MW)
+  c2_default:   0.5    # quadratic cost coeff
+  pg_lim_frac:  0.30   # ±30% of initial dispatch defines Pg_min / Pg_max
+  s_max_pu:     1.0    # thermal limit (pu apparent power) when not in dataset
+
+train:
+  batch_size: 32
+  epochs: 100
+  lr: 3.0e-4
+  val_every: 5         # validate every 5 epochs to keep log concise
+
+optimizer:
+  weight_init: sd0.02
+  bias_init: 0.0
+  weight_decay: 1.0e-3
+  lr_scheduler: CosineAnnealingLR
+  cosine_restart_epoch: 50  # warm restart at epoch 50
+
+misc:
+  adj_mode: cplx
+
+peft:
+  enabled: false
+
+mlflow:
+  enabled: false
+  tracking_uri: sqlite:///results/mlflow.db
+  artifact_location: file:./results/mlruns
+  experiment: opf_pignn_attn_ls
+  artifact_path: run
+  keep_local_run_dir: true
+  strict: false

@@ -1,0 +1,90 @@
+# Multi-size generalization config (Objective 5).
+#
+# Trains Model 2 (physics-informed) on a combined dataset of 5-bus and 8-bus
+# ring grids. Tests cross-size generalization: the GNN is permutation-equivariant
+# and architecture-agnostic to N, so the same weights should generalize.
+#
+# Generate the combined datasets first:
+#   python datasets/generate_synthetic.py 1000   (→ synthetic_opf_n5_ring.parquet)
+#   python datasets/generate_ring.py 8 800       (→ synthetic_opf_n8_ring.parquet)
+#   python datasets/generate_ring.py 10 600      (→ synthetic_opf_n10_ring.parquet)
+#
+# Then train with this config:
+#   python -m train --config configs/opf_pignn_multisize.yaml
+
+run:
+  name: null
+  mode: train_test
+  seed: 42
+
+split:
+  mode: ratio
+  train_ratio: 0.80
+  valid_ratio: 0.10
+
+data:
+  parquet_paths:
+    - ./datasets/synthetic_opf_n5_ring.parquet
+    - ./datasets/synthetic_opf_n8_ring.parquet
+    - ./datasets/synthetic_opf_n10_ring.parquet
+  per_unit: false
+
+flags:
+  pinn: true
+  block_diag: true    # required for variable-N batching
+  normalize: false
+  mag_ang_mse: false
+  float64: false
+
+model:
+  name: GNSMsg_EdgeSelfAttn_OPF
+
+  d: 4
+  d_hi: 16
+  num_attn_layers: 1
+  K: 15
+  gamma: 0.95
+  vlimit: true
+  use_armijo: true
+  DthetaMax: 0.30
+  DvmFrac: 0.10
+
+  lambda_cost:   1.0
+  lambda_kcl:    5.0
+  lambda_lim:   20.0
+  lambda_branch:  2.0
+  lambda_v:       2.0
+
+  pg_step_frac: 0.05
+  c1_default:   2.0
+  c2_default:   0.5
+  pg_lim_frac:  0.30
+  s_max_pu:     1.0
+
+train:
+  batch_size: 32
+  epochs: 80
+  lr: 3.0e-4
+  val_every: 5
+
+optimizer:
+  weight_init: sd0.02
+  bias_init: 0.0
+  weight_decay: 1.0e-3
+  lr_scheduler: CosineAnnealingLR
+  cosine_restart_epoch: 40
+
+misc:
+  adj_mode: cplx
+
+peft:
+  enabled: false
+
+mlflow:
+  enabled: false
+  tracking_uri: sqlite:///results/mlflow.db
+  artifact_location: file:./results/mlruns
+  experiment: opf_multisize
+  artifact_path: run
+  keep_local_run_dir: true
+  strict: false

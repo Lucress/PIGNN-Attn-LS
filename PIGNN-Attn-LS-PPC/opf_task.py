@@ -169,7 +169,10 @@ def opf_residual_and_violation(
     else:
         vp = torch.clamp(p_min - gen_p, min=0.0) + torch.clamp(gen_p - p_max, min=0.0)
         vq = torch.clamp(q_min - gen_q, min=0.0) + torch.clamp(gen_q - q_max, min=0.0)
-        vp = torch.where(ctrl, vp, torch.zeros_like(vp))
+        # Zero-capacity buses (p_max==0 AND p_min==0) are placeholder generators;
+        # any tiny gen_p drift would count as a violation. Exclude them.
+        active_gen = (p_max > 0) | (p_min < 0)
+        vp = torch.where(ctrl & active_gen, vp, torch.zeros_like(vp))
         vq = torch.where(ctrl, vq, torch.zeros_like(vq))
     return {"dp": dp, "dq": dq, "vp": vp, "vq": vq,
             "gen_p": torch.where(ctrl, gen_p, torch.zeros_like(gen_p)), "ctrl": ctrl}
@@ -332,6 +335,22 @@ def opf_metrics(
     cost_true = float(dispatch_cost(true["gen_p"], space).item())
     denom = abs(cost_true) if abs(cost_true) > 1e-9 else 1.0
 
+    # Per-scenario feasibility: ALL 4 core constraints < 0.01 pu simultaneously
+    _FEAS_THRESH = 0.01
+    n_feas, offset = 0, 0
+    for ni in n_nodes.tolist():
+        ni = int(ni)
+        sc_free = free[offset:offset + ni]
+        sc_ctrl = ctrl[offset:offset + ni]
+        dp_sc = float(pred["dp"][offset:offset + ni][sc_free].max().item()) if sc_free.any() else 0.0
+        dq_sc = float(pred["dq"][offset:offset + ni][sc_free].max().item()) if sc_free.any() else 0.0
+        vp_sc = float(pred["vp"][offset:offset + ni][sc_ctrl].max().item()) if sc_ctrl.any() else 0.0
+        vq_sc = float(pred["vq"][offset:offset + ni][sc_ctrl].max().item()) if sc_ctrl.any() else 0.0
+        if max(dp_sc, dq_sc, vp_sc, vq_sc) < _FEAS_THRESH:
+            n_feas += 1
+        offset += ni
+    feas_rate = n_feas / max(n_nodes.numel(), 1)
+
     return {
         "dp_inf_pu": dp_inf, "dq_inf_pu": dq_inf,
         "dp_mean_pu": dp_mean, "dq_mean_pu": dq_mean,
@@ -341,15 +360,17 @@ def opf_metrics(
         "vband_max_pu": band_max, "vband_frac": band_frac,
         "cost_pred": cost_pred, "cost_true": cost_true,
         "cost_gap_rel": (cost_pred - cost_true) / denom,
+        "feas_rate": feas_rate,
     }
 
 
 def format_opf_metrics(m: Dict[str, float]) -> str:
+    feas_str = f" feas({m['feas_rate']*100:.1f}%)" if "feas_rate" in m else ""
     return (
         f"balance(dPinf {m['dp_inf_pu']:.3e}, dQinf {m['dq_inf_pu']:.3e} pu over "
         f"{m['n_free_buses']:.0f} free buses) "
         f"limits(P {m['p_limit_max_pu']:.3e}, Q {m['q_limit_max_pu']:.3e} pu over "
         f"{m['n_ctrl_buses']:.0f} ctrl buses) "
         f"vband(max {m['vband_max_pu']:.3e}, frac {m['vband_frac']:.3f}) "
-        f"cost(gap {m['cost_gap_rel']*100:.2f}%)"
+        f"cost(gap {m['cost_gap_rel']*100:.2f}%){feas_str}"
     )

@@ -1,0 +1,15 @@
+{
+  "label": "PINN (physics-only)",
+  "n_scenarios": 30,
+  "n_nodes": 14,
+  "K": 30,
+  "r_attn_flow": -0.46263287683799104,
+  "p_attn_flow": 1.1079320056152364e-64,
+  "r_attn_vdev": 0.017631366706370763,
+  "p_attn_vdev": 0.7186328024236464,
+  "mean_attn_by_type": {
+    "slack": 1.0,
+    "gen": 1.0,
+    "load": 1.0
+  }
+}

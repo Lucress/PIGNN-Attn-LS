@@ -48,6 +48,25 @@ venv/
 /tmp/
 /PIGNN-Attn-LS-PPC/tmp/
 /PIGNN-Attn-LS-PPC/output/
+# OPF dataset — thousands of raw JSON/parquet files, too large for git
+/PIGNN-Attn-LS-PPC/opfdata/
+# LVN variant results directory
+/PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/results/
+
+# ---------------------------------------------------------------------------
+# Internal notes and handoff documents — not for supervisor review
+# ---------------------------------------------------------------------------
+# All handoff / session notes moved here during reorganization
+/PIGNN-Attn-LS-PPC/docs/
+# Literature reading notes and template (personal; cite via opf_pignn.bib instead)
+/paper/literature/
+# Internal paper-folder README (structure notes for author, not content)
+/paper/README.md
+# Training log markdown (internal run notes)
+/paper/latex/PPC_Cases_PIGNN_logs.md
+# LVN planning docs
+/PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/RESEARCH_DIRECTION.md
+/PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/UNDERSTANDING.md
 # exclude the contents (not the directory itself) so the negation below applies
 /ScenarioSynthesis_PPC/out/*
 # ...but keep the inspection helpers that live next to the generated parquet

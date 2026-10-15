@@ -1,6 +1,39 @@
 
 ---
 
+## Repository Structure
+
+```
+PIGNN-Attn-LS/
+├── paper/                          # Report / thesis writing
+│   ├── latex/                      # LaTeX source (NeurIPS 2026 style)
+│   ├── references/                 # ref.bib, ref_simplified.bib
+│   ├── figures/                    # Final paper figures
+│   ├── literature/                 # Notes on related papers (one .md per paper)
+│   ├── supplementary/              # Step-by-step derivation notebooks
+│   └── experiments_log.md          # All experiment results in one place
+│
+├── PIGNN-Attn-LS-PPC/              # AC-OPF variant (IEEE case14/118/500)
+│   ├── GNSMsg_SelfAttention_armijo.py   # Main PIGNN model
+│   ├── opf_task.py                 # OPF task, feasibility metric
+│   ├── train_valid_test_pignn_opf.py    # Training script
+│   ├── analyze_xai_pdl6.py         # XAI / attention analysis
+│   ├── train_valid_test_opfdata.py # GridFM / OPFData baselines
+│   ├── sbatch/
+│   │   ├── active/                 # Current experiments (dhi32 best, GridFM)
+│   │   ├── ablations/              # Completed ablation experiments
+│   │   └── archive/                # Old PDL versions and early experiments
+│   ├── docs/                       # Research notes and setup guides
+│   ├── results/                    # Checkpoints, logs, XAI outputs
+│   └── PIGNN-Attn-LS-LVN/         # LV network variant (YAML config)
+│
+├── ScenarioSynthesisHVN*/          # HVN scenario generation
+├── GNSMsg_SelfAttention_armijo.py  # HVN model (root)
+└── train_valid_test.py             # HVN training script (root)
+```
+
+---
+
 # Train, Test & Benchmark
 
 ## Requirements

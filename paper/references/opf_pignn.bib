@@ -1,0 +1,141 @@
+% OPF + PIGNN-Attn-LS Bibliography
+% Papers directly related to this project: primal-dual learning, AC-OPF surrogates, GNNs for power systems.
+% The file paper/references/ref.bib is for a separate HTR project and is unrelated.
+
+% ============================================================
+% PRIMAL-DUAL LEARNING / LAGRANGIAN METHODS (the lambda papers)
+% ============================================================
+
+% The paper most directly behind our adaptive-lambda (PDL) formulation.
+% Proposes augmenting the neural OPF loss with Lagrangian dual terms (lambda_bal, lambda_lim)
+% and updating multipliers via subgradient ascent: lambda += lr * violation.
+@inproceedings{fioretto2020predicting,
+  title     = {Predicting {AC} Optimal Power Flows: Combining Deep Learning and {L}agrangian Dual Methods},
+  author    = {Fioretto, Ferdinando and Mak, Terrence W. K. and Van Hentenryck, Pascal},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume    = {34},
+  number    = {01},
+  pages     = {630--637},
+  year      = {2020},
+  doi       = {10.1609/aaai.v34i01.5403},
+  note      = {arXiv:1909.10461}
+}
+
+% Named "primal-dual learning" (matches our PDL terminology).
+% Self-supervised: no OPF solver needed at training time; uses primal-dual gap as a signal.
+@inproceedings{park2023selfsupervised,
+  title     = {Self-Supervised Primal-Dual Learning for Constrained Optimization},
+  author    = {Park, Seonho and Van Hentenryck, Pascal},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  year      = {2023},
+  doi       = {10.1609/aaai.v37i4.25520},
+  note      = {arXiv:2208.09046}
+}
+
+% Hard-constraint satisfaction via differentiable completion + correction.
+% Alternative to soft-penalty / lambda approach — useful contrast for paper.
+@inproceedings{donti2021dc3,
+  title     = {{DC3}: A Learning Method for Optimization with Hard Constraints},
+  author    = {Donti, Priya L. and Rolnick, David and Kolter, J. Zico},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2021},
+  note      = {arXiv:2104.12225}
+}
+
+% ============================================================
+% AC-OPF DEEP LEARNING BASELINES
+% ============================================================
+
+% First major feasibility-optimized deep learning approach for AC-OPF.
+% Defines feasibility using constraint violation magnitudes (not binary threshold).
+% arXiv preprint; verify DOI on IEEE Xplore for final publication status.
+@article{pan2020deepopf,
+  title   = {{DeepOPF}: A Feasibility-Optimized Deep Neural Network Approach for {AC} Optimal Power Flow Problems},
+  author  = {Pan, Xiang and Chen, Minghua and Zhao, Tianyu and Low, Steven H.},
+  journal = {arXiv preprint arXiv:2007.01002},
+  year    = {2020},
+  note    = {arXiv:2007.01002. Verify final publication status (possible IEEE Trans. Power Systems).}
+}
+
+% ============================================================
+% DATASET
+% ============================================================
+
+% The OPFData dataset used for GridFM training in this project (dataset_release_1).
+% From Google DeepMind; case118 data lives at opfdata/dataset_release_1/pglib_opf_case118_ieee/.
+@article{lovett2024opfdata,
+  title   = {{OPFData}: Large-Scale Datasets for {AC} Optimal Power Flow with Topological Perturbations},
+  author  = {Lovett, Sean and Zgubivc, Miha and Liguori, Sofia and Madjiheurem, Sephora and Tomlinson, Hamish and Elster, Sophie and Apps, Chris and Witherspoon, Sims and Piloto, Luis},
+  journal = {arXiv preprint arXiv:2406.07234},
+  year    = {2024},
+  note    = {arXiv:2406.07234}
+}
+
+% GNN topology approach for OPF. Uses graph structure to guide neural predictions.
+% Related to our GNN message-passing architecture.
+@article{falconer2021leveraging,
+  title   = {Leveraging Power Grid Topology in Machine Learning Assisted Optimal Power Flow},
+  author  = {Falconer, Thomas and Mones, Letif},
+  journal = {arXiv preprint arXiv:2110.00306},
+  year    = {2021},
+  note    = {arXiv:2110.00306}
+}
+
+% ============================================================
+% FEASIBILITY METRIC JUSTIFICATION
+% ============================================================
+
+% Closest precedent for our binary feasibility metric.
+% Reports "percentage of scenarios satisfying constraints" at four binary thresholds:
+% 0.01, 1e-4, 1e-6, 1e-8 absolute violation — 0.01 matches our _FEAS_THRESH exactly.
+% Same Google DeepMind group as OPFData. Also a direct baseline/related work for case118.
+@article{piloto2024canos,
+  title   = {{CANOS}: A Fast and Scalable Neural {AC-OPF} Solver Robust To {N-1} Perturbations},
+  author  = {Piloto, Luis and Liguori, Sofia and Madjiheurem, Sephora and Zgubi{\v{c}}, Miha
+             and Lovett, Sean and Tomlinson, Hamish and Elster, Sophie and Apps, Chris
+             and Witherspoon, Sims},
+  journal = {arXiv preprint arXiv:2403.17660},
+  year    = {2024},
+  note    = {arXiv:2403.17660}
+}
+
+% Standard reference for Newton-Raphson power flow convergence tolerance (pf.tol = 1e-8 pu).
+% Our 0.01 pu threshold is a relaxed NR criterion appropriate for ML-based approximations.
+% Cite when justifying the 0.01 pu threshold as physically grounded.
+@article{zimmerman2011matpower,
+  author  = {Zimmerman, R. D. and Murillo-S{\'a}nchez, C. E. and Thomas, R. J.},
+  title   = {{MATPOWER}: Steady-State Operations, Planning, and Analysis Tools for Power Systems Research and Education},
+  journal = {{IEEE} Transactions on Power Systems},
+  volume  = {26},
+  number  = {1},
+  pages   = {12--19},
+  year    = {2011},
+  doi     = {10.1109/TPWRS.2010.2051168}
+}
+
+% Only paper found that explicitly connects the ML-OPF evaluation tolerance to NR convergence.
+% Trains at epsilon=1e-9, tests at epsilon=1e-4, and notes the tolerance choice affects
+% reported feasibility. Supports the argument that evaluation threshold selection is principled.
+@inproceedings{baker2020learningboosted,
+  author    = {Baker, Kyri},
+  title     = {A Learning-boosted Quasi-{N}ewton Method for {AC} Optimal Power Flow},
+  booktitle = {NeurIPS 2020 Workshop on Machine Learning for Engineering Modeling, Simulation and Design},
+  year      = {2020},
+  note      = {arXiv:2007.06074}
+}
+
+% ============================================================
+% COMPLEMENTARY / CONTEXT
+% ============================================================
+
+% Fast AC-OPF surrogate using supervised learning on standard OPF cases.
+% Uses SmartGridComm benchmark (case118 among others). Relevant comparison context.
+@inproceedings{zamzam2020learning,
+  title        = {Learning Optimal Solutions for Extremely Fast {AC} Optimal Power Flow},
+  author       = {Zamzam, Ahmed S. and Baker, Kyri},
+  booktitle    = {2020 IEEE International Conference on Communications, Control, and Computing Technologies for Smart Grids (SmartGridComm)},
+  pages        = {1--6},
+  year         = {2020},
+  organization = {IEEE},
+  note         = {arXiv:1910.01213}
+}

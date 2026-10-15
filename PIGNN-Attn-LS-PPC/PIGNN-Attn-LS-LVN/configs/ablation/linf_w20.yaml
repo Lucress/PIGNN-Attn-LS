@@ -1,0 +1,60 @@
+# Ablation: lambda_kcl_inf = 20.0
+run:
+  name: ablation_linf_w20
+  mode: train_test
+  seed: 42
+split:
+  mode: ratio
+  train_ratio: 0.80
+  valid_ratio: 0.10
+data:
+  parquet_paths:
+    - ./datasets/synthetic_opf_n5_ring.parquet
+  per_unit: false
+flags:
+  pinn: true
+  block_diag: true
+  normalize: false
+  mag_ang_mse: false
+  float64: false
+model:
+  name: GNSMsg_EdgeSelfAttn_OPF
+  d: 4
+  d_hi: 16
+  num_attn_layers: 1
+  K: 15
+  gamma: 0.95
+  vlimit: true
+  use_armijo: true
+  DthetaMax: 0.30
+  DvmFrac: 0.10
+  lambda_cost:    1.0
+  lambda_kcl:     5.0
+  lambda_kcl_inf: 20.0
+  lambda_lim:    20.0
+  lambda_branch:  2.0
+  lambda_v:       2.0
+  pg_step_frac: 0.05
+  c1_default:   2.0
+  c2_default:   0.5
+  pg_lim_frac:  0.30
+  s_max_pu:     1.0
+train:
+  batch_size: 32
+  epochs: 60
+  lr: 3.0e-4
+  val_every: 5
+optimizer:
+  weight_init: sd0.02
+  bias_init: 0.0
+  weight_decay: 1.0e-3
+  lr_scheduler: CosineAnnealingLR
+  cosine_restart_epoch: 30
+misc:
+  adj_mode: cplx
+peft:
+  enabled: false
+mlflow:
+  enabled: false
+  keep_local_run_dir: true
+  strict: false
