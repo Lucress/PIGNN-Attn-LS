@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Generated data and model weights
+# ---------------------------------------------------------------------------
+/tmp/
+/output/
+/opfdata/
+/results/ckpt/
+/results/logs/
+/results/plots/
+
+# ---------------------------------------------------------------------------
+# Sbatch job scripts — local/HPC-specific, not for GitHub
+# ---------------------------------------------------------------------------
+/sbatch/
+
+# ---------------------------------------------------------------------------
+# Internal notes — local only, not for supervisor review
+# ---------------------------------------------------------------------------
+/docs/
+/paper/literature/
+/paper/README.md
+/paper/latex/PPC_Cases_PIGNN_logs.md
+/Master'sProject/
+
+# ---------------------------------------------------------------------------
+# LVN variant — internal planning docs and results
+# ---------------------------------------------------------------------------
+/PIGNN-Attn-LS-LVN/results/
+/PIGNN-Attn-LS-LVN/RESEARCH_DIRECTION.md
+/PIGNN-Attn-LS-LVN/UNDERSTANDING.md

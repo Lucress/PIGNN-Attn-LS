@@ -1,8 +1,5 @@
 # ---------------------------------------------------------------------------
 # Vendored / cloned third-party repositories
-# Each of these is a separate upstream project cloned into this working tree.
-# They are NOT part of this repo; clone them with the commands in
-# PIGNN-Attn-LS-PPC/GRIDFM_GRIDSFM_WINDOWS_GPU_RUN.md
 # ---------------------------------------------------------------------------
 /CGMES_to_PandaPower/
 /CGMES_to_PandaPower2/
@@ -29,11 +26,10 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
-# MS Office lock files
 ~$*
 
 # ---------------------------------------------------------------------------
-# Generated datasets and model weights (too large for git)
+# Large binaries and generated files (too large for git)
 # ---------------------------------------------------------------------------
 *.parquet
 *.pt
@@ -46,66 +42,15 @@ venv/
 /data/
 /output/
 /tmp/
-/PIGNN-Attn-LS-PPC/tmp/
-/PIGNN-Attn-LS-PPC/output/
-# OPF dataset — thousands of raw JSON/parquet files, too large for git
-/PIGNN-Attn-LS-PPC/opfdata/
-# LVN variant results directory
-/PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/results/
 
 # ---------------------------------------------------------------------------
-# Internal notes and handoff documents — not for supervisor review
-# ---------------------------------------------------------------------------
-# All handoff / session notes moved here during reorganization
-/PIGNN-Attn-LS-PPC/docs/
-# Literature reading notes and template (personal; cite via opf_pignn.bib instead)
-/paper/literature/
-# Internal paper-folder README (structure notes for author, not content)
-/paper/README.md
-# Training log markdown (internal run notes)
-/paper/latex/PPC_Cases_PIGNN_logs.md
-# LVN planning docs
-/PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/RESEARCH_DIRECTION.md
-/PIGNN-Attn-LS-PPC/PIGNN-Attn-LS-LVN/UNDERSTANDING.md
-# Master's project documents — local only
-/PIGNN-Attn-LS-PPC/Master'sProject/
-# exclude the contents (not the directory itself) so the negation below applies
-/ScenarioSynthesis_PPC/out/*
-# ...but keep the inspection helpers that live next to the generated parquet
-!/ScenarioSynthesis_PPC/out/*.py
-/PIGNN-Attn-LS-PPC/results/ckpt/
-# Downloaded CGMES grid models and their debug dumps (tens of MB each; the
-# ENTSO-E RealGridTest EQ profile alone is 64 MB, past GitHub's 50 MB warning)
-/ScenarioSynthesis_PPC/CGMES/
-/ScenarioSynthesis_PPC/CGMES_LVN_Debug/
-# ...but keep the scripts that read them
-!/ScenarioSynthesis_PPC/CGMES/**/*.py
-!/ScenarioSynthesis_PPC/CGMES_LVN_Debug/**/*.py
-
-# ---------------------------------------------------------------------------
-# Run artifacts: Slurm output, training logs, per-run metric dumps
+# Run artifacts
 # ---------------------------------------------------------------------------
 *.out
 *.err
 *.log
 *_training_log.txt
 terminal_log_capture*.txt
-# All sbatch directories — local only, not for GitHub
-/sbatch/
-/PIGNN-Attn-LS-PPC/sbatch/
-/ScenarioSynthesis/sbatch/
-/ScenarioSynthesis_IEEE/sbatch/
-/ScenarioSynthesis_PPC/sbatch/
-/PIGNN-Attn-LS-PPC/results/logs/
-/PIGNN-Attn-LS-PPC/results/plots/
-
-# ---------------------------------------------------------------------------
-# Slurm / SSH job and dispatch scripts. These are machine- and run-specific
-# (node names, partitions, absolute paths, timestamps) and are regenerated per
-# experiment, so they are not worth versioning. The handful committed before
-# this rule stay tracked; git only skips new ones. Use `git add -f` to
-# deliberately version a particular script.
-# ---------------------------------------------------------------------------
 *.sh
 
 # ---------------------------------------------------------------------------
@@ -131,5 +76,21 @@ terminal_log_capture*.txt
 *.out.ps
 *.synctex.gz
 *.toc
+
+# ---------------------------------------------------------------------------
+# All sbatch directories — local only
+# ---------------------------------------------------------------------------
+/sbatch/
+/ScenarioSynthesis/sbatch/
+/ScenarioSynthesis_IEEE/sbatch/
+/ScenarioSynthesis_PPC/sbatch/
+
+# ScenarioSynthesis generated outputs
+/ScenarioSynthesis_PPC/out/*
+!/ScenarioSynthesis_PPC/out/*.py
+/ScenarioSynthesis_PPC/CGMES/
+/ScenarioSynthesis_PPC/CGMES_LVN_Debug/
+!/ScenarioSynthesis_PPC/CGMES/**/*.py
+!/ScenarioSynthesis_PPC/CGMES_LVN_Debug/**/*.py
 
 CLAUDE_CHECKPOINT.md
